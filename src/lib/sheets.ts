@@ -26,8 +26,13 @@ function getAuthClient() {
       'See SETUP.md → "Service account for Sheets API".',
     );
   }
-  // .env files often store the key with literal "\n" — convert back to real newlines.
-  const privateKey = rawKey.replace(/\\n/g, '\n');
+  // The key arrives in slightly different shapes depending on how it was set:
+  //  - .env.local via dotenv: dotenv strips surrounding quotes for us.
+  //  - Fly secrets: stored verbatim, so wrapping quotes from the JSON or
+  //    .env file pass through and break PEM parsing ("DECODER unsupported").
+  // Strip wrapping quotes (if any), then convert literal "\n" to real newlines.
+  const stripped = rawKey.trim().replace(/^["']/, '').replace(/["']$/, '');
+  const privateKey = stripped.replace(/\\n/g, '\n');
   return new google.auth.JWT({ email, key: privateKey, scopes: SCOPES });
 }
 
