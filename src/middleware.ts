@@ -9,5 +9,11 @@ import withAuth from 'next-auth/middleware';
 export default withAuth;
 
 export const config = {
-  matcher: ['/dashboard/:path*', '/api/sheets/:path*'],
+  matcher: [
+    '/dashboard/:path*',
+    '/accessories/:path*',
+    '/sku/:path*',
+    '/reorder/:path*',
+    '/api/sheets/:path*',
+  ],
 };

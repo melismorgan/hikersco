@@ -1,26 +1,18 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import type { ApparelDashboardRow } from '@/lib/inventory';
+import type { AccessoriesDashboardRow } from '@/lib/inventory';
 
 interface Props {
-  rows: ApparelDashboardRow[];
+  rows: AccessoriesDashboardRow[];
 }
 
 /**
- * Apparel dashboard grid — client component so we can run a search filter
- * and an active-only toggle in the browser without a server round-trip.
- *
- * Editorial-minimal styling (matches the v2 spec from the workbook):
- * - Rows pre-sorted Style → Active → Color → Size_Order on the server.
- * - Style alternation: warm-beige tint vs warm-white per Style block.
- * - First row of a new Style: Style name in bold indigo (anchor).
- * - First row of a new Color within a Style: Color name in indigo.
- * - Repeated Style/Color values: rendered in warm-gray (ghost-repeat).
- * - Days Cover semantic colors: <14 ironclad, 14–30 clay, ≥30 sage.
- * - Numeric columns use mono + tabular-nums so columns align to the digit.
+ * Accessories dashboard — non-sized SKUs (Billfolds, TRICK*, hook packs).
+ * Same editorial-minimal aesthetic as Apparel; just simpler since there's
+ * no Size dimension and no case-pack split.
  */
-export function ApparelGrid({ rows: allRows }: Props) {
+export function AccessoriesGrid({ rows: allRows }: Props) {
   const [query, setQuery] = useState('');
   const [activeOnly, setActiveOnly] = useState(true);
 
@@ -32,8 +24,7 @@ export function ApparelGrid({ rows: allRows }: Props) {
       return (
         r.sku.toLowerCase().includes(q) ||
         r.style.toLowerCase().includes(q) ||
-        r.color.toLowerCase().includes(q) ||
-        r.size.toLowerCase().includes(q)
+        r.color.toLowerCase().includes(q)
       );
     });
   }, [allRows, query, activeOnly]);
@@ -42,27 +33,22 @@ export function ApparelGrid({ rows: allRows }: Props) {
     return (
       <div className="rounded-lg border border-warm-gray/60 bg-warm-beige/40 p-8 text-center">
         <p className="text-charcoal/70">
-          No apparel SKUs found. Check that <code className="px-1 bg-warm-white rounded">Category</code>{' '}
-          equals <code className="px-1 bg-warm-white rounded">Apparel</code> in SKU Master.
+          No accessories SKUs found. Check that <code className="px-1 bg-warm-white rounded">Category</code>{' '}
+          equals <code className="px-1 bg-warm-white rounded">Accessories</code> in SKU Master.
         </p>
       </div>
     );
   }
 
-  // Decorate rows with first-of-style / first-of-color flags + style block index
-  // for alternating tint. Recomputed when the visible rows change so a search
-  // result doesn't render with broken style banding.
-  const decorated: { row: ApparelDashboardRow; firstOfStyle: boolean; firstOfColor: boolean; tint: number }[] = [];
+  // Style banding decoration (only Style alternates here — no within-style color groups).
+  const decorated: { row: AccessoriesDashboardRow; firstOfStyle: boolean; tint: number }[] = [];
   let lastStyle: string | null = null;
-  let lastColor: string | null = null;
   let styleIdx = -1;
   for (const row of rows) {
     const firstOfStyle = row.style !== lastStyle;
-    const firstOfColor = firstOfStyle || row.color !== lastColor;
     if (firstOfStyle) styleIdx++;
-    decorated.push({ row, firstOfStyle, firstOfColor, tint: styleIdx % 2 });
+    decorated.push({ row, firstOfStyle, tint: styleIdx % 2 });
     lastStyle = row.style;
-    lastColor = row.color;
   }
 
   return (
@@ -70,18 +56,13 @@ export function ApparelGrid({ rows: allRows }: Props) {
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <input
           type="text"
-          placeholder="Search SKU, Style, Color, Size…"
+          placeholder="Search SKU, Style, Color…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           className="flex-1 min-w-[200px] max-w-md px-3 py-2 rounded-md border border-warm-gray/60 bg-warm-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo/40 focus:border-indigo/60"
         />
         <label className="flex items-center gap-2 text-sm text-charcoal/70 select-none cursor-pointer">
-          <input
-            type="checkbox"
-            checked={activeOnly}
-            onChange={(e) => setActiveOnly(e.target.checked)}
-            className="accent-indigo"
-          />
+          <input type="checkbox" checked={activeOnly} onChange={(e) => setActiveOnly(e.target.checked)} className="accent-indigo" />
           Active only
         </label>
         <span className="text-xs text-charcoal/50">
@@ -97,24 +78,20 @@ export function ApparelGrid({ rows: allRows }: Props) {
                 <Th className="text-left">Style</Th>
                 <Th className="text-left">Color</Th>
                 <Th className="text-left font-mono">SKU</Th>
-                <Th className="text-left">Size</Th>
                 <Th className="text-right">ShipBob</Th>
-                <Th className="text-right text-charcoal/50" title="Individual on-hand at Twin Lakes">Indiv</Th>
-                <Th className="text-right text-charcoal/50" title="Case-pack equivalent units">Case</Th>
                 <Th className="text-right">FBA</Th>
                 <Th className="text-right">AWD</Th>
                 <Th className="text-right">Amz</Th>
-                <Th className="text-right" title="Air freight inbound">Air</Th>
-                <Th className="text-right" title="Sea freight inbound">Sea</Th>
+                <Th className="text-right" title="Air + Sea inbound">In-Transit</Th>
                 <Th className="text-right" title="Draft PO quantity">Draft</Th>
                 <Th className="text-right">Total</Th>
-                <Th className="text-right" title="Avg units sold per day, 30d window">Avg/Day</Th>
-                <Th className="text-right" title="Days of cover at current avg/day">Cover</Th>
+                <Th className="text-right">Avg/Day</Th>
+                <Th className="text-right">Cover</Th>
                 <Th className="text-right">$ On Hand</Th>
               </tr>
             </thead>
             <tbody>
-              {decorated.map(({ row, firstOfStyle, firstOfColor, tint }) => {
+              {decorated.map(({ row, firstOfStyle, tint }) => {
                 const tintClass = tint === 0 ? 'bg-warm-white' : 'bg-warm-beige/30';
                 const inactive = !row.active;
                 return (
@@ -129,33 +106,21 @@ export function ApparelGrid({ rows: allRows }: Props) {
                         <span className="text-warm-gray">{row.style}</span>
                       )}
                     </Td>
-                    <Td>
-                      {firstOfColor ? (
-                        <span className="font-medium text-indigo">{row.color}</span>
-                      ) : (
-                        <span className="text-warm-gray">{row.color}</span>
-                      )}
-                    </Td>
+                    <Td>{row.color || <span className="text-warm-gray">—</span>}</Td>
                     <Td className="font-mono text-xs">
                       <a href={`/sku/${encodeURIComponent(row.sku)}`} className="hover:text-indigo hover:underline">
                         {row.sku}
                       </a>
                     </Td>
-                    <Td>{row.size}</Td>
-                    <Td className="text-right font-mono font-semibold">{fmt(row.shipbobWiTotal)}</Td>
-                    <Td className="text-right font-mono text-charcoal/50">{fmt(row.indivOnHand)}</Td>
-                    <Td className="text-right font-mono text-charcoal/50">{fmt(row.casePackEqv)}</Td>
+                    <Td className="text-right font-mono font-semibold">{fmt(row.shipbobWi)}</Td>
                     <Td className="text-right font-mono">{fmt(row.fbaAvailable)}</Td>
                     <Td className="text-right font-mono">{fmt(row.awdStorage)}</Td>
                     <Td className="text-right font-mono font-semibold">{fmt(row.amazonTotal)}</Td>
-                    <Td className="text-right font-mono text-charcoal/60">{fmt(row.inTransitAir)}</Td>
-                    <Td className="text-right font-mono text-charcoal/60">{fmt(row.inTransitSea)}</Td>
+                    <Td className="text-right font-mono text-charcoal/60">{fmt(row.inTransit)}</Td>
                     <Td className="text-right font-mono text-charcoal/60">{fmt(row.draftPo)}</Td>
                     <Td className="text-right font-mono font-semibold">{fmt(row.totalOnHand)}</Td>
                     <Td className="text-right font-mono">{row.avgPerDay30d > 0 ? row.avgPerDay30d.toFixed(1) : '—'}</Td>
-                    <Td className="text-right">
-                      <DaysCover days={row.daysCover} />
-                    </Td>
+                    <Td className="text-right"><DaysCover days={row.daysCover} /></Td>
                     <Td className="text-right font-mono text-charcoal/70">
                       {row.valueOnHand > 0 ? fmtCurrency(row.valueOnHand) : ''}
                     </Td>
@@ -170,12 +135,6 @@ export function ApparelGrid({ rows: allRows }: Props) {
   );
 }
 
-/**
- * Days Cover cell with the brand's semantic-color band:
- * - <14 days: Iron-Clad Red (reorder yesterday)
- * - 14–30 days: Clay Amber (reorder soon)
- * - ≥30 days: Sage (healthy)
- */
 function DaysCover({ days }: { days: number | null }) {
   if (days === null) return <span className="text-charcoal/30">—</span>;
   let color = 'text-sage';
@@ -192,20 +151,12 @@ function DaysCover({ days }: { days: number | null }) {
 function Th({ children, className = '', title }: { children: React.ReactNode; className?: string; title?: string }) {
   return <th className={`px-3 py-2 font-medium ${className}`} title={title} scope="col">{children}</th>;
 }
-
 function Td({ children, className = '' }: { children: React.ReactNode; className?: string }) {
   return <td className={`px-3 py-1.5 ${className}`}>{children}</td>;
 }
-
-function fmt(n: number): string {
-  if (!n) return '—';
-  return n.toLocaleString();
-}
-
+function fmt(n: number): string { return n ? n.toLocaleString() : '—'; }
 function fmtCurrency(n: number): string {
   return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
+    style: 'currency', currency: 'USD', maximumFractionDigits: 0,
   }).format(n);
 }
