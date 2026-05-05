@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* HIKERS Co. brand palette — ratified 2026-04-20.
+   Mirrored in tailwind.config.ts and src/lib/brand.ts. */
+:root {
+  --color-indigo: #4A5490;
+  --color-indigo-wash: #E6E8F1;
+  --color-periwinkle: #7A84AC;
+  --color-periwinkle-wash: #DDE1EE;
+  --color-ironclad: #B63B38;
+  --color-clay: #C98A55;
+  --color-sage: #7F8B6C;
+  --color-sage-wash: #EAEDE2;
+  --color-warm-white: #FAF8F3;
+  --color-warm-beige: #EFE9DD;
+  --color-warm-gray: #D3CEC4;
+  --color-charcoal: #1F2337;
+  --color-cancelled: #E5E2DA;
+}
+
+@layer base {
+  html, body {
+    background-color: var(--color-warm-white);
+    color: var(--color-charcoal);
+  }
+
+  body {
+    font-family: var(--font-work-sans), ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3 {
+    font-family: var(--font-fraunces), ui-serif, Georgia, serif;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+
+  /* Tabular numbers for any cell that displays counts/$$ — keeps columns aligned. */
+  .num, td.num, th.num, .font-mono {
+    font-variant-numeric: tabular-nums;
+  }
+}
