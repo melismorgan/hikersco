@@ -26,17 +26,12 @@ import {
   type ApparelDashboardRow,
   type AccessoriesDashboardRow,
 } from './inventory';
+import {
+  AMAZON_SHARE, AMAZON_SLOW_MOVER_GATE_DAYS, PO_LEG_FLOOR, ceilTo,
+} from './policy';
 
+export { AMAZON_SHARE, AMAZON_SLOW_MOVER_GATE_DAYS, PO_LEG_FLOOR };
 export const DEFAULT_TARGET_DAYS = 90;
-export const AMAZON_SLOW_MOVER_GATE_DAYS = 45;
-export const PO_LEG_FLOOR = 100;
-export const AMAZON_SHARE = 0.75;
-
-/** Round up to the nearest multiple of `step`. ceilTo100(101) = 200, etc. */
-function ceilTo(n: number, step: number): number {
-  if (n <= 0) return 0;
-  return Math.ceil(n / step) * step;
-}
 
 export interface ReorderInput {
   sku: string;

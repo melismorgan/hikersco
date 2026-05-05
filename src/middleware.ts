@@ -14,6 +14,9 @@ export const config = {
     '/accessories/:path*',
     '/sku/:path*',
     '/reorder/:path*',
+    '/velocity/:path*',
+    '/pos/:path*',
     '/api/sheets/:path*',
+    '/api/po/:path*',
   ],
 };

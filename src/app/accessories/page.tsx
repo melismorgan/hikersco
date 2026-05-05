@@ -2,7 +2,7 @@ import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { Header } from '@/components/Header';
 import { AccessoriesGrid } from '@/components/AccessoriesGrid';
-import { loadAccessoriesDashboard } from '@/lib/inventory';
+import { loadAccessoriesDashboard, readStyleLines, readStyleSuppliers, getDraftPoSummaries } from '@/lib/inventory';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -12,9 +12,21 @@ export default async function AccessoriesPage() {
   const email = session?.user?.email ?? null;
 
   let rows: Awaited<ReturnType<typeof loadAccessoriesDashboard>> = [];
+  let styleLineMap: Record<string, string> = {};
+  let styleSupplierMap: Record<string, string> = {};
+  let existingDrafts: Awaited<ReturnType<typeof getDraftPoSummaries>> = [];
   let loadError: string | null = null;
   try {
-    rows = await loadAccessoriesDashboard();
+    const [r, sl, ss, ed] = await Promise.all([
+      loadAccessoriesDashboard(),
+      readStyleLines(),
+      readStyleSuppliers(),
+      getDraftPoSummaries(),
+    ]);
+    rows = r;
+    styleLineMap = Object.fromEntries(sl);
+    styleSupplierMap = Object.fromEntries(ss);
+    existingDrafts = ed;
   } catch (err) {
     loadError = err instanceof Error ? err.message : String(err);
   }
@@ -32,7 +44,7 @@ export default async function AccessoriesPage() {
           <div>
             <h1 className="text-3xl mb-1">Accessories</h1>
             <p className="text-sm text-charcoal/60">
-              Non-sized SKUs — Billfolds, TRICK*, hook packs. Sorted Style → Active → Color.
+              Non-sized SKUs — Hook Packs, Rear Hooks, Wallets. Sorted by line, then Style → Color.
             </p>
           </div>
           <div className="flex gap-6 text-sm">
@@ -46,7 +58,7 @@ export default async function AccessoriesPage() {
         {loadError ? (
           <ErrorBox error={loadError} />
         ) : (
-          <AccessoriesGrid rows={rows} />
+          <AccessoriesGrid rows={rows} styleLineMap={styleLineMap} styleSupplierMap={styleSupplierMap} existingDrafts={existingDrafts} />
         )}
       </main>
     </>

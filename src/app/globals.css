@@ -42,3 +42,35 @@
     font-variant-numeric: tabular-nums;
   }
 }
+
+/* Apparel grid — sticky identity column.
+ * SKU is the only sticky column. Style is conveyed by the line banners
+ * (HIKERS / Upfitter / Heavy-Duty / etc.); Color is shown on the group
+ * summary row inside the SKU cell; Size is encoded in the SKU itself.
+ */
+.sticky-sku { position: sticky; left: 0; z-index: 1; }
+thead .sticky-sku { z-index: 30; }
+
+/* Sticky top header for all dashboard tables.
+ * Apply class `dash-table` to a <table> and every <th> in its <thead>
+ * stays glued to the top of the viewport on vertical scroll.
+ *
+ * `overflow-y: visible` on the inner scroll wrapper is necessary because
+ * `overflow-x: auto` (used for horizontal table scrolling) computes
+ * `overflow-y` to `auto` by default, which would create an inner scroll
+ * context that breaks viewport-anchored sticky. The wrapper class
+ * `dash-scroll` sets the right combo: x-auto, y-visible.
+ *
+ * Sticky-LEFT cells in thead get a higher z-index (30) than sticky-only-top
+ * cells (25), so the top-left corner cell layers correctly when both axes
+ * are scrolled.
+ */
+.dash-scroll {
+  overflow-x: auto;
+  overflow-y: visible;
+}
+.dash-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 25;
+}

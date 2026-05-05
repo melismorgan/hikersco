@@ -2,7 +2,7 @@ import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { Header } from '@/components/Header';
 import { ApparelGrid } from '@/components/ApparelGrid';
-import { loadApparelDashboard } from '@/lib/inventory';
+import { loadApparelDashboard, readStyleLines, readStyleSuppliers, getDraftPoSummaries } from '@/lib/inventory';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -12,14 +12,25 @@ export default async function DashboardPage() {
   const email = session?.user?.email ?? null;
 
   let rows: Awaited<ReturnType<typeof loadApparelDashboard>> = [];
+  let styleLineMap: Record<string, string> = {};
+  let styleSupplierMap: Record<string, string> = {};
+  let existingDrafts: Awaited<ReturnType<typeof getDraftPoSummaries>> = [];
   let loadError: string | null = null;
   try {
-    rows = await loadApparelDashboard();
+    const [r, sl, ss, ed] = await Promise.all([
+      loadApparelDashboard(),
+      readStyleLines(),
+      readStyleSuppliers(),
+      getDraftPoSummaries(),
+    ]);
+    rows = r;
+    styleLineMap = Object.fromEntries(sl);
+    styleSupplierMap = Object.fromEntries(ss);
+    existingDrafts = ed;
   } catch (err) {
     loadError = err instanceof Error ? err.message : String(err);
   }
 
-  // Quick rollup for the header KPIs.
   const totalSkus = rows.length;
   const totalUnits = rows.reduce((s, r) => s + r.totalOnHand, 0);
   const totalValue = rows.reduce((s, r) => s + r.valueOnHand, 0);
@@ -48,15 +59,9 @@ export default async function DashboardPage() {
           <div className="rounded-lg border border-ironclad/40 bg-ironclad/5 p-6">
             <p className="font-semibold text-ironclad mb-2">Couldn’t load the sheet.</p>
             <pre className="text-xs text-charcoal/80 whitespace-pre-wrap">{loadError}</pre>
-            <p className="text-xs text-charcoal/60 mt-3">
-              Common causes: the service account isn’t shared on the sheet (share the
-              <code className="mx-1 px-1 bg-warm-beige rounded">GOOGLE_SERVICE_ACCOUNT_EMAIL</code>
-              as Editor), or <code className="mx-1 px-1 bg-warm-beige rounded">SHEET_ID</code>
-              doesn’t match the live workbook.
-            </p>
           </div>
         ) : (
-          <ApparelGrid rows={rows} />
+          <ApparelGrid rows={rows} styleLineMap={styleLineMap} styleSupplierMap={styleSupplierMap} existingDrafts={existingDrafts} />
         )}
       </main>
     </>

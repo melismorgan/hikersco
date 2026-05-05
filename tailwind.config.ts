@@ -31,6 +31,10 @@ const config: Config = {
           white: '#FAF8F3',
           beige: '#EFE9DD',
           gray:  '#D3CEC4',
+          // Pre-blended `warmWhite × 70% + warmBeige × 30%` — used for the
+          // alternating row tint. Must be OPAQUE (not an alpha overlay) so it
+          // works correctly under sticky-positioned identity columns.
+          tint:  '#F7F4EC',
         },
         charcoal: '#1F2337',
         // PO-status: cancelled

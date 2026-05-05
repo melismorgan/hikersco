@@ -90,3 +90,96 @@ export async function appendRows(tabName: string, rows: (string | number)[][]): 
     requestBody: { values: rows },
   });
 }
+
+// Cache of tab name → numeric sheet id (gid). Required for batchUpdate
+// requests that target a specific sheet (delete row, etc.).
+let _sheetIdCache: Map<string, number> | null = null;
+
+async function getTabSheetId(tabName: string): Promise<number> {
+  if (_sheetIdCache?.has(tabName)) return _sheetIdCache.get(tabName)!;
+  const res = await sheets().spreadsheets.get({
+    spreadsheetId: sheetId(),
+    fields: 'sheets(properties(sheetId,title))',
+  });
+  const m = new Map<string, number>();
+  for (const s of res.data.sheets ?? []) {
+    if (s.properties?.title && typeof s.properties.sheetId === 'number') {
+      m.set(s.properties.title, s.properties.sheetId);
+    }
+  }
+  _sheetIdCache = m;
+  const id = m.get(tabName);
+  if (id === undefined) throw new Error(`Sheet tab "${tabName}" not found.`);
+  return id;
+}
+
+/**
+ * Ensure a tab with the given name exists. If absent, creates it via
+ * batchUpdate addSheet. Returns whether the tab was just created.
+ */
+export async function ensureTabExists(tabName: string): Promise<{ created: boolean }> {
+  // Drop the cache before checking so we don't see a stale "doesn't exist".
+  _sheetIdCache = null;
+  try {
+    await getTabSheetId(tabName);
+    return { created: false };
+  } catch {
+    // Not found — create it.
+    await sheets().spreadsheets.batchUpdate({
+      spreadsheetId: sheetId(),
+      requestBody: {
+        requests: [{ addSheet: { properties: { title: tabName } } }],
+      },
+    });
+    _sheetIdCache = null;
+    return { created: true };
+  }
+}
+
+/**
+ * Delete entire rows from a tab. Rows are identified by 1-based sheet row
+ * number (header is 1, first data row is 2). We sort descending and submit
+ * one batchUpdate so each deletion doesn't invalidate the still-pending
+ * indexes — Sheets API processes batchUpdate requests sequentially against
+ * the running state, so descending order keeps everything pointing at the
+ * correct cells.
+ */
+export async function deleteRows(tabName: string, rowIndices: number[]): Promise<void> {
+  if (rowIndices.length === 0) return;
+  const tabId = await getTabSheetId(tabName);
+  const sorted = [...new Set(rowIndices)].sort((a, b) => b - a);
+  await sheets().spreadsheets.batchUpdate({
+    spreadsheetId: sheetId(),
+    requestBody: {
+      requests: sorted.map((rowIndex) => ({
+        deleteDimension: {
+          range: {
+            sheetId: tabId,
+            dimension: 'ROWS',
+            startIndex: rowIndex - 1,  // batchUpdate uses 0-based, exclusive end
+            endIndex: rowIndex,
+          },
+        },
+      })),
+    },
+  });
+}
+
+/**
+ * Update specific cells via batch — efficient when you're modifying a few
+ * fields on a known row rather than rewriting the whole row. Each entry's
+ * `range` is an A1-style range (e.g. "'POs'!F12") and `value` is the single
+ * cell value to write. Caller is responsible for column↔field mapping.
+ */
+export async function batchUpdateCells(
+  updates: Array<{ range: string; value: string | number }>,
+): Promise<void> {
+  if (updates.length === 0) return;
+  await sheets().spreadsheets.values.batchUpdate({
+    spreadsheetId: sheetId(),
+    requestBody: {
+      valueInputOption: 'USER_ENTERED',
+      data: updates.map((u) => ({ range: u.range, values: [[u.value]] })),
+    },
+  });
+}

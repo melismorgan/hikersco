@@ -147,9 +147,9 @@ export function ReorderTable({ report, initialTargetDays }: Props) {
       </div>
 
       {/* Table */}
-      <div className="rounded-lg border border-warm-gray/40 overflow-hidden bg-warm-white">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm border-collapse">
+      <div className="rounded-lg border border-warm-gray/40 bg-warm-white">
+        <div className="dash-scroll">
+          <table className="dash-table w-full text-sm border-separate border-spacing-0">
             <thead>
               <tr className="bg-periwinkle/15 text-charcoal/80 text-xs uppercase tracking-wider">
                 <Th className="text-left">SKU</Th>
