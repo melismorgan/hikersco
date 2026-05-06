@@ -66,7 +66,8 @@ export function ReorderTable({ report, initialTargetDays }: Props) {
     const header = [
       'SKU', 'Category', 'Style', 'Color', 'Size',
       'Total OH', 'Amz Total', 'In-Transit', 'Draft PO',
-      'Avg/Day', 'Days Cover',
+      'Avg/Day 30d', 'Effective Avg/Day', 'Velocity Adjusted',
+      'Spike Units', 'Days Cover',
       'Amz Eligible', 'Eligibility Reason',
       'Amz Plan', 'SB Plan', 'Total Plan', 'Est. Cost',
     ];
@@ -78,6 +79,9 @@ export function ReorderTable({ report, initialTargetDays }: Props) {
       s.sku, s.category, s.style, s.color, s.size,
       s.totalOnHand, s.amazonTotal, s.inTransit, s.draftPo,
       s.avgPerDay30d.toFixed(2),
+      s.effectiveAvgPerDay.toFixed(2),
+      s.velocityAdjusted ? 'Y' : '',
+      s.spikeUnits || '',
       s.effectiveDaysCover === Infinity ? '∞' : s.effectiveDaysCover.toFixed(1),
       s.amazonEligible ? 'Y' : 'N',
       s.amazonEligibilityReason,
@@ -104,6 +108,45 @@ export function ReorderTable({ report, initialTargetDays }: Props) {
         <Stat label="Total units" value={report.totals.totalUnits.toLocaleString()} accent />
         <Stat label="Est. cost" value={fmtCurrency(report.totals.estimatedCost)} accent />
       </div>
+
+      {/* Events banner — only renders when at least one Event influenced the
+          numbers above. Shows what was adjusted and why so the math is
+          legible. */}
+      {report.appliedEvents.length > 0 && (
+        <div className="rounded-lg border border-periwinkle/60 bg-periwinkle/10 p-4">
+          <div className="text-xs uppercase tracking-wider text-charcoal/60 mb-2">
+            Events applied to this reorder
+          </div>
+          <ul className="space-y-1.5 text-sm">
+            {report.appliedEvents.map((ev) => (
+              <li key={ev.eventId} className="flex flex-wrap items-baseline gap-x-2">
+                <span className="font-mono text-xs text-charcoal/60">{ev.eventId}</span>
+                <span className="font-medium text-charcoal">{ev.name}</span>
+                <span className="text-xs text-charcoal/50">
+                  {ev.type} · {ev.status}
+                  {ev.startDate && ` · ${ev.startDate}`}
+                  {ev.endDate && ` → ${ev.endDate}`}
+                </span>
+                <span className="ml-auto text-xs text-charcoal/70 font-mono">
+                  {ev.velocityAdjustedSkuCount > 0 && (
+                    <span className="mr-3">
+                      {ev.velocityAdjustedSkuCount} SKU{ev.velocityAdjustedSkuCount === 1 ? '' : 's'} → 90d Avg
+                    </span>
+                  )}
+                  {ev.spikedSkuCount > 0 && (
+                    <span>
+                      +{ev.totalSpikeUnits.toLocaleString()} units across {ev.spikedSkuCount} SKU{ev.spikedSkuCount === 1 ? '' : 's'}
+                    </span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <div className="text-xs text-charcoal/50 mt-2">
+            Edit on the <span className="font-mono">Events</span> tab of the workbook.
+          </div>
+        </div>
+      )}
 
       {/* Controls */}
       <div className="rounded-lg border border-warm-gray/40 bg-warm-white p-4 space-y-3">
@@ -189,6 +232,10 @@ export function ReorderTable({ report, initialTargetDays }: Props) {
 
 function ReorderRow({ s }: { s: ReorderSuggestion }) {
   const needsReorder = s.totalPlan > 0;
+  // The displayed Avg/Day reflects whichever number actually drove the math:
+  // 90d when an Events exclusion is in effect, 30d otherwise. The 30d cell
+  // is dimmed to show it was overridden, with a tooltip explaining why.
+  const displayedAvg = s.velocityAdjusted ? s.effectiveAvgPerDay : s.avgPerDay30d;
   return (
     <tr className={`border-b border-warm-gray/20 hover:bg-indigo/5 ${needsReorder ? '' : 'opacity-50'}`}>
       <Td className="font-mono text-xs">
@@ -197,14 +244,34 @@ function ReorderRow({ s }: { s: ReorderSuggestion }) {
       <Td>{s.style}</Td>
       <Td>{s.color}</Td>
       <Td>{s.size}</Td>
-      <Td className="text-right font-mono">{s.avgPerDay30d > 0 ? s.avgPerDay30d.toFixed(1) : '—'}</Td>
+      <Td className="text-right font-mono">
+        {displayedAvg > 0 ? displayedAvg.toFixed(1) : '—'}
+        {s.velocityAdjusted && (
+          <span
+            className="ml-1 px-1 rounded bg-periwinkle/30 text-charcoal/70 text-[10px] font-sans align-middle cursor-help"
+            title={s.velocityAdjustReason || '90d Avg/Day substituted for 30d due to active Event exclusion'}
+          >
+            90d
+          </span>
+        )}
+      </Td>
       <Td className="text-right"><DaysCoverBadge days={s.effectiveDaysCover} /></Td>
       <Td className="text-right font-mono">{s.totalOnHand.toLocaleString()}</Td>
       <Td className="text-right font-mono text-charcoal/70">{s.amazonTotal.toLocaleString()}</Td>
       <Td className="text-right font-mono text-charcoal/60">{s.inTransit.toLocaleString()}</Td>
       <Td className="text-right font-mono font-semibold text-indigo">{s.amzPlan ? s.amzPlan.toLocaleString() : '—'}</Td>
       <Td className="text-right font-mono font-semibold text-indigo">{s.sbPlan ? s.sbPlan.toLocaleString() : '—'}</Td>
-      <Td className="text-right font-mono font-semibold">{s.totalPlan ? s.totalPlan.toLocaleString() : '—'}</Td>
+      <Td className="text-right font-mono font-semibold">
+        {s.totalPlan ? s.totalPlan.toLocaleString() : '—'}
+        {s.spikeUnits > 0 && (
+          <span
+            className="ml-1 px-1 rounded bg-clay/15 text-clay text-[10px] font-sans align-middle cursor-help"
+            title={s.spikeReason || `+${s.spikeUnits} units from upcoming Event(s)`}
+          >
+            +{s.spikeUnits}
+          </span>
+        )}
+      </Td>
       <Td className="text-right font-mono text-charcoal/70">
         {s.estimatedCost > 0 ? fmtCurrency(s.estimatedCost) : ''}
       </Td>

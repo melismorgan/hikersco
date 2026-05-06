@@ -5,7 +5,16 @@ import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { appendRows, batchUpdateCells, deleteRows, ensureTabExists } from '@/lib/sheets';
 import { splitDraft } from '@/lib/policy';
-import { readPos, readSuppliers } from '@/lib/inventory';
+import {
+  readPos,
+  readPoPayments,
+  readPoPaymentTransactions,
+  readShipments,
+  readShipmentLines,
+  readSuppliers,
+  DEFAULT_DEPOSIT_PCT,
+  type ShipmentStatus,
+} from '@/lib/inventory';
 
 /**
  * Map of editable PO fields → POs-tab column letters. Anchored to the
@@ -479,6 +488,639 @@ export async function bulkUpdatePos(
   revalidatePath('/reorder');
 
   return { ok: true, updated: updates.length };
+}
+
+// =====================================================================
+// PO Payments — the PLAN per PO #. Actuals live on a sibling tab
+// (`PO Payment Transactions`) where each money transfer is one row.
+// Schema in lib/inventory.ts. Two suppliers in one PO is forbidden by the
+// PO-creation flow, so PO # is a stable key.
+// =====================================================================
+
+const PO_PAYMENTS_HEADER: string[] = [
+  'PO #',
+  'Deposit %',
+  'Deposit Due Date',
+  'Balance Due Date',
+  'Notes',
+];
+
+const PO_PAYMENTS_COL: Record<string, string> = {
+  poNumber:       'A',
+  depositPct:     'B',
+  depositDueDate: 'C',
+  balanceDueDate: 'D',
+  notes:          'E',
+};
+
+export interface PoPaymentUpdateFields {
+  depositPct?: number;        // 0..1 (0.20 = 20%)
+  depositDueDate?: string;
+  balanceDueDate?: string;
+  notes?: string;
+}
+
+// =====================================================================
+// PO Payment Transactions — one row per actual money transfer.
+// =====================================================================
+
+const PO_PAYMENT_TXNS_HEADER: string[] = [
+  'PO #',
+  'Type',          // Deposit | Balance | Shipping
+  'Date',
+  'Amount',        // principal sent to recipient
+  'Fee',           // Alibaba/platform fee on this transaction (0 if none)
+  'Notes',
+  'Shipment ID',   // links Shipping txs to a row on Shipments tab; blank otherwise
+];
+
+const PO_PAYMENT_TXNS_COL: Record<string, string> = {
+  poNumber:   'A',
+  type:       'B',
+  date:       'C',
+  amount:     'D',
+  fee:        'E',
+  notes:      'F',
+  shipmentId: 'G',
+};
+
+export interface PoPaymentTxnFields {
+  type?: 'Deposit' | 'Balance' | 'Shipping';
+  date?: string;
+  amount?: number;
+  fee?: number;
+  notes?: string;
+  shipmentId?: string;
+}
+
+/**
+ * Idempotent: ensure both `PO Payments` and `PO Payment Transactions` tabs
+ * exist with their headers. Safe to call repeatedly. Used by the upsert
+ * actions before they write so a fresh workbook just-works.
+ */
+export async function setupPoPaymentsTab(): Promise<{
+  ok: boolean;
+  created: boolean;
+  seeded: boolean;
+  error?: string;
+}> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) {
+    return { ok: false, created: false, seeded: false, error: 'Not authenticated.' };
+  }
+  try {
+    let createdAny = false;
+    let seededAny  = false;
+
+    // Plan tab
+    const planRes = await ensureTabExists('PO Payments');
+    createdAny = createdAny || planRes.created;
+    const existingPlan = await readPoPayments();
+    if (existingPlan.size === 0) {
+      await batchUpdateCells(
+        PO_PAYMENTS_HEADER.map((h, i) => ({
+          range: `'PO Payments'!${String.fromCharCode(65 + i)}1`,
+          value: h,
+        })),
+      );
+      seededAny = true;
+    }
+
+    // Transactions tab
+    const txnRes = await ensureTabExists('PO Payment Transactions');
+    createdAny = createdAny || txnRes.created;
+    const existingTxns = await readPoPaymentTransactions();
+    if (existingTxns.size === 0) {
+      await batchUpdateCells(
+        PO_PAYMENT_TXNS_HEADER.map((h, i) => ({
+          range: `'PO Payment Transactions'!${String.fromCharCode(65 + i)}1`,
+          value: h,
+        })),
+      );
+      seededAny = true;
+    }
+
+    revalidatePath('/pos');
+    revalidatePath('/cashflow');
+    return { ok: true, created: createdAny, seeded: seededAny };
+  } catch (err) {
+    return { ok: false, created: false, seeded: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Upsert the PLAN row for a PO (deposit %, due dates, notes). If a row
+ * already exists, named fields are batch-updated in place (sparse). If
+ * none exists, a fresh row is appended with the given fields and the rest
+ * blank (depositPct defaults to 20%).
+ *
+ * Empty string clears a field. Use the transaction CRUD actions below to
+ * record actual money transfers — those don't go through this function.
+ */
+export async function updatePoPayment(
+  poNumber: string,
+  fields: PoPaymentUpdateFields,
+): Promise<{ ok: boolean; created: boolean; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, created: false, error: 'Not authenticated.' };
+
+  const po = (poNumber || '').trim();
+  if (!po) return { ok: false, created: false, error: 'PO # is required.' };
+
+  if (fields.depositPct !== undefined) {
+    const p = Number(fields.depositPct);
+    if (!Number.isFinite(p) || p < 0 || p > 1) {
+      return { ok: false, created: false, error: 'depositPct must be a fraction between 0 and 1 (e.g. 0.20).' };
+    }
+  }
+
+  await ensureTabExists('PO Payments');
+  const existing = await readPoPayments();
+  const row = existing.get(po);
+
+  if (row) {
+    const cells: Array<{ range: string; value: string | number }> = [];
+    for (const [key, value] of Object.entries(fields)) {
+      if (value === undefined) continue;
+      const col = PO_PAYMENTS_COL[key];
+      if (!col) continue;
+      cells.push({ range: `'PO Payments'!${col}${row.rowIndex}`, value: value as string | number });
+    }
+    if (cells.length === 0) {
+      return { ok: false, created: false, error: 'No fields to update.' };
+    }
+    try {
+      await batchUpdateCells(cells);
+    } catch (err) {
+      return { ok: false, created: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    revalidatePath('/pos');
+    revalidatePath('/cashflow');
+    return { ok: true, created: false };
+  }
+
+  // No plan row yet — append a fresh one with header guaranteed.
+  if (existing.size === 0) {
+    await batchUpdateCells(
+      PO_PAYMENTS_HEADER.map((h, i) => ({
+        range: `'PO Payments'!${String.fromCharCode(65 + i)}1`,
+        value: h,
+      })),
+    );
+  }
+  const depositPct = fields.depositPct ?? DEFAULT_DEPOSIT_PCT;
+  const newRow: (string | number)[] = [
+    po,                              // A PO #
+    depositPct,                      // B Deposit %
+    fields.depositDueDate ?? '',     // C
+    fields.balanceDueDate ?? '',     // D
+    fields.notes          ?? '',     // E
+  ];
+  try {
+    await appendRows('PO Payments', [newRow]);
+  } catch (err) {
+    return { ok: false, created: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  revalidatePath('/pos');
+  revalidatePath('/cashflow');
+  return { ok: true, created: true };
+}
+
+// ---------------------------------------------------------------------
+// Transaction CRUD — append-only style for actuals.
+// ---------------------------------------------------------------------
+
+async function ensurePoPaymentTxnsTab(): Promise<void> {
+  await ensureTabExists('PO Payment Transactions');
+  const existing = await readPoPaymentTransactions();
+  if (existing.size === 0) {
+    // Header may or may not be present. We can't trivially read row 1 from
+    // here without another helper; just write the header — batchUpdateCells
+    // is idempotent at the cell level (overwrites with the same value).
+    await batchUpdateCells(
+      PO_PAYMENT_TXNS_HEADER.map((h, i) => ({
+        range: `'PO Payment Transactions'!${String.fromCharCode(65 + i)}1`,
+        value: h,
+      })),
+    );
+  }
+}
+
+function validateTxnFields(fields: PoPaymentTxnFields, requireAll: boolean): string | null {
+  if (requireAll || fields.type !== undefined) {
+    if (fields.type !== 'Deposit' && fields.type !== 'Balance' && fields.type !== 'Shipping') {
+      return 'Type must be Deposit, Balance, or Shipping.';
+    }
+  }
+  if (requireAll || fields.amount !== undefined) {
+    const a = Number(fields.amount);
+    if (!Number.isFinite(a) || a <= 0) {
+      return 'Amount must be a positive number.';
+    }
+  }
+  if (fields.fee !== undefined) {
+    const f = Number(fields.fee);
+    if (!Number.isFinite(f) || f < 0) {
+      return 'Fee must be a non-negative number (0 if none).';
+    }
+  }
+  if (requireAll || fields.date !== undefined) {
+    const d = String(fields.date ?? '').trim();
+    if (!d) return 'Date is required.';
+    const ts = Date.parse(d);
+    if (!Number.isFinite(ts)) return 'Date must be a valid date (e.g. 2026-05-05).';
+  }
+  return null;
+}
+
+/**
+ * Append a single payment transaction. PO # must already exist on the POs
+ * tab — we don't validate that here (the UI shouldn't let you reach this
+ * with a bogus PO #), but the join in loadPoSummaries will simply ignore
+ * orphan transactions.
+ */
+export async function addPoPaymentTransaction(
+  poNumber: string,
+  fields: {
+    type: 'Deposit' | 'Balance' | 'Shipping';
+    date: string;
+    amount: number;
+    fee?: number;
+    notes?: string;
+    shipmentId?: string;
+  },
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, error: 'Not authenticated.' };
+
+  const po = (poNumber || '').trim();
+  if (!po) return { ok: false, error: 'PO # is required.' };
+  const err = validateTxnFields(fields, true);
+  if (err) return { ok: false, error: err };
+
+  await ensurePoPaymentTxnsTab();
+
+  const newRow: (string | number)[] = [
+    po,
+    fields.type,
+    fields.date,
+    Number(fields.amount),
+    Number(fields.fee ?? 0),
+    fields.notes ?? '',
+    fields.shipmentId ?? '',
+  ];
+  try {
+    await appendRows('PO Payment Transactions', [newRow]);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  revalidatePath('/pos');
+  revalidatePath('/cashflow');
+  return { ok: true };
+}
+
+/** Edit an existing transaction in place by its row index. Sparse fields. */
+export async function updatePoPaymentTransaction(
+  rowIndex: number,
+  fields: PoPaymentTxnFields,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, error: 'Not authenticated.' };
+
+  if (!Number.isInteger(rowIndex) || rowIndex < 2) {
+    return { ok: false, error: `Invalid row index: ${rowIndex}` };
+  }
+  const err = validateTxnFields(fields, false);
+  if (err) return { ok: false, error: err };
+
+  const cells: Array<{ range: string; value: string | number }> = [];
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined) continue;
+    const col = PO_PAYMENT_TXNS_COL[key];
+    if (!col) continue;
+    cells.push({ range: `'PO Payment Transactions'!${col}${rowIndex}`, value: value as string | number });
+  }
+  if (cells.length === 0) {
+    return { ok: false, error: 'No fields to update.' };
+  }
+  try {
+    await batchUpdateCells(cells);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  revalidatePath('/pos');
+  revalidatePath('/cashflow');
+  return { ok: true };
+}
+
+/** Hard-delete one or more transactions by row index. */
+export async function deletePoPaymentTransactions(
+  rowIndices: number[],
+): Promise<{ ok: boolean; deleted: number; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, deleted: 0, error: 'Not authenticated.' };
+
+  if (!Array.isArray(rowIndices) || rowIndices.length === 0) {
+    return { ok: false, deleted: 0, error: 'No rows to delete.' };
+  }
+  for (const i of rowIndices) {
+    if (!Number.isInteger(i) || i < 2) return { ok: false, deleted: 0, error: `Invalid row index: ${i}` };
+  }
+  try {
+    await deleteRows('PO Payment Transactions', rowIndices);
+  } catch (e) {
+    return { ok: false, deleted: 0, error: e instanceof Error ? e.message : String(e) };
+  }
+  revalidatePath('/pos');
+  revalidatePath('/cashflow');
+  return { ok: true, deleted: rowIndices.length };
+}
+
+// =====================================================================
+// Shipments + Shipment Lines — physical shipment tracking. A PO can
+// produce N shipments; each shipment goes to ONE destination warehouse.
+// Shipping payment transactions optionally link via shipmentId.
+// =====================================================================
+
+const SHIPMENTS_HEADER: string[] = [
+  'Shipment ID',
+  'PO #',
+  'Label',
+  'Mode',                 // Air | Sea | Truck
+  'Destination',          // AWD Storage | ShipBob WI
+  'Departure Date',
+  'ETA',
+  'Status',               // Planning | In Transit | Received | Cancelled
+  'Carrier',
+  'Tracking #',
+  'Receiving Order ID',   // AWD inbound ID or ShipBob WRO ID
+  'Estimated Cost',
+  'Notes',
+];
+
+const SHIPMENTS_COL: Record<string, string> = {
+  shipmentId:        'A',
+  poNumber:          'B',
+  label:             'C',
+  mode:              'D',
+  destination:       'E',
+  departureDate:     'F',
+  eta:               'G',
+  status:            'H',
+  carrier:           'I',
+  trackingNumber:    'J',
+  receivingOrderId:  'K',
+  estimatedCost:     'L',
+  notes:             'M',
+};
+
+const SHIPMENT_LINES_HEADER: string[] = ['Shipment ID', 'SKU', 'Qty'];
+
+const SHIPMENT_STATUSES: ShipmentStatus[] = ['Planning', 'In Transit', 'Received', 'Cancelled'];
+const SHIPMENT_MODES = ['Air', 'Sea', 'Truck'];
+
+export interface ShipmentFields {
+  label?: string;
+  mode?: string;
+  destination?: string;
+  departureDate?: string;
+  eta?: string;
+  status?: ShipmentStatus;
+  carrier?: string;
+  trackingNumber?: string;
+  receivingOrderId?: string;
+  estimatedCost?: number;
+  notes?: string;
+}
+
+export interface ShipmentLineInput {
+  sku: string;
+  qty: number;
+}
+
+async function ensureShipmentTabs(): Promise<void> {
+  await ensureTabExists('Shipments');
+  const ships = await readShipments();
+  if (ships.size === 0) {
+    await batchUpdateCells(
+      SHIPMENTS_HEADER.map((h, i) => ({
+        range: `'Shipments'!${String.fromCharCode(65 + i)}1`,
+        value: h,
+      })),
+    );
+  }
+  await ensureTabExists('Shipment Lines');
+  const lines = await readShipmentLines();
+  if (lines.size === 0) {
+    await batchUpdateCells(
+      SHIPMENT_LINES_HEADER.map((h, i) => ({
+        range: `'Shipment Lines'!${String.fromCharCode(65 + i)}1`,
+        value: h,
+      })),
+    );
+  }
+}
+
+function nextShipmentId(existingIds: Iterable<string>, alreadyAssigned: Set<string>): string {
+  const re = /^SHP-(\d+)$/i;
+  let max = 0;
+  for (const id of existingIds) {
+    const m = id.match(re);
+    if (m) max = Math.max(max, parseInt(m[1], 10) || 0);
+  }
+  for (const id of alreadyAssigned) {
+    const m = id.match(re);
+    if (m) max = Math.max(max, parseInt(m[1], 10) || 0);
+  }
+  return `SHP-${String(max + 1).padStart(5, '0')}`;
+}
+
+function validateShipmentFields(fields: ShipmentFields, requireAll: boolean): string | null {
+  if (requireAll || fields.mode !== undefined) {
+    if (!fields.mode || !SHIPMENT_MODES.includes(fields.mode)) {
+      return `Mode must be one of: ${SHIPMENT_MODES.join(', ')}`;
+    }
+  }
+  if (requireAll || fields.destination !== undefined) {
+    if (!fields.destination || !fields.destination.trim()) {
+      return 'Destination is required.';
+    }
+  }
+  if (fields.status !== undefined && !SHIPMENT_STATUSES.includes(fields.status)) {
+    return `Status must be one of: ${SHIPMENT_STATUSES.join(', ')}`;
+  }
+  if (fields.estimatedCost !== undefined) {
+    const v = Number(fields.estimatedCost);
+    if (!Number.isFinite(v) || v < 0) return 'Estimated cost must be a non-negative number.';
+  }
+  return null;
+}
+
+/**
+ * Create a new Shipment for a PO with optional initial line allocations.
+ * Generates the next sequential SHP-NNNNN ID. Status defaults to 'Planning'.
+ */
+export async function createShipment(
+  poNumber: string,
+  fields: ShipmentFields,
+  lines: ShipmentLineInput[] = [],
+): Promise<{ ok: boolean; shipmentId?: string; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, error: 'Not authenticated.' };
+
+  const po = (poNumber || '').trim();
+  if (!po) return { ok: false, error: 'PO # is required.' };
+  const vErr = validateShipmentFields(fields, true);
+  if (vErr) return { ok: false, error: vErr };
+
+  await ensureShipmentTabs();
+  const existing = await readShipments();
+  const shipmentId = nextShipmentId(existing.keys(), new Set());
+
+  const status: ShipmentStatus = fields.status ?? 'Planning';
+  const newRow: (string | number)[] = [
+    shipmentId,
+    po,
+    fields.label ?? '',
+    fields.mode!,
+    fields.destination!,
+    fields.departureDate ?? '',
+    fields.eta ?? '',
+    status,
+    fields.carrier ?? '',
+    fields.trackingNumber ?? '',
+    fields.receivingOrderId ?? '',
+    Number(fields.estimatedCost ?? 0),
+    fields.notes ?? '',
+  ];
+  try {
+    await appendRows('Shipments', [newRow]);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  if (lines.length > 0) {
+    const lineRows = lines
+      .filter((l) => l.sku && l.qty > 0)
+      .map((l) => [shipmentId, l.sku, Number(l.qty)] as (string | number)[]);
+    if (lineRows.length > 0) {
+      try {
+        await appendRows('Shipment Lines', lineRows);
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    }
+  }
+  revalidatePath('/pos');
+  revalidatePath('/cashflow');
+  return { ok: true, shipmentId };
+}
+
+/** Update fields on an existing shipment (sparse). */
+export async function updateShipment(
+  shipmentId: string,
+  fields: ShipmentFields,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, error: 'Not authenticated.' };
+
+  const id = (shipmentId || '').trim();
+  if (!id) return { ok: false, error: 'Shipment ID is required.' };
+  const vErr = validateShipmentFields(fields, false);
+  if (vErr) return { ok: false, error: vErr };
+
+  const existing = await readShipments();
+  const sh = existing.get(id);
+  if (!sh) return { ok: false, error: `Shipment ${id} not found.` };
+
+  const cells: Array<{ range: string; value: string | number }> = [];
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined) continue;
+    const col = SHIPMENTS_COL[key];
+    if (!col) continue;
+    cells.push({ range: `'Shipments'!${col}${sh.rowIndex}`, value: value as string | number });
+  }
+  if (cells.length === 0) return { ok: false, error: 'No fields to update.' };
+
+  try {
+    await batchUpdateCells(cells);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  revalidatePath('/pos');
+  revalidatePath('/cashflow');
+  return { ok: true };
+}
+
+/**
+ * Replace all line allocations for a shipment with the given list. Existing
+ * rows are deleted; provided list is appended fresh. Empty list = delete all
+ * lines for this shipment.
+ */
+export async function replaceShipmentLines(
+  shipmentId: string,
+  lines: ShipmentLineInput[],
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, error: 'Not authenticated.' };
+
+  const id = (shipmentId || '').trim();
+  if (!id) return { ok: false, error: 'Shipment ID is required.' };
+
+  await ensureShipmentTabs();
+  const existing = await readShipmentLines();
+  const oldLines = existing.get(id) ?? [];
+  if (oldLines.length > 0) {
+    try {
+      await deleteRows('Shipment Lines', oldLines.map((l) => l.rowIndex));
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  const filtered = lines.filter((l) => l.sku && l.qty > 0);
+  if (filtered.length > 0) {
+    const rows = filtered.map((l) => [id, l.sku, Number(l.qty)] as (string | number)[]);
+    try {
+      await appendRows('Shipment Lines', rows);
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  revalidatePath('/pos');
+  return { ok: true };
+}
+
+/**
+ * Hard-delete a shipment AND its line allocations. Any shipping transactions
+ * still pointing to this shipmentId become "unassigned" (their col G no
+ * longer matches a real shipment). They keep counting toward PO totals.
+ */
+export async function deleteShipment(
+  shipmentId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, error: 'Not authenticated.' };
+
+  const id = (shipmentId || '').trim();
+  if (!id) return { ok: false, error: 'Shipment ID is required.' };
+
+  const ships = await readShipments();
+  const sh = ships.get(id);
+  if (!sh) return { ok: false, error: `Shipment ${id} not found.` };
+
+  const lineMap = await readShipmentLines();
+  const lineRows = (lineMap.get(id) ?? []).map((l) => l.rowIndex);
+
+  try {
+    if (lineRows.length > 0) {
+      await deleteRows('Shipment Lines', lineRows);
+    }
+    await deleteRows('Shipments', [sh.rowIndex]);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  revalidatePath('/pos');
+  revalidatePath('/cashflow');
+  return { ok: true };
 }
 
 function buildSupplierPoRow({ poNumber, supplier, sku, qty, dest, unitCost, today, note }: {

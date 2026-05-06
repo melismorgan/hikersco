@@ -16,7 +16,10 @@ export function Header({ email }: HeaderProps) {
           <Link href="/accessories" className="hover:text-indigo">Accessories</Link>
           <Link href="/velocity" className="hover:text-indigo">Velocity</Link>
           <Link href="/pos" className="hover:text-indigo">POs</Link>
+          <Link href="/shipments" className="hover:text-indigo">Shipments</Link>
+          <Link href="/cashflow" className="hover:text-indigo">Cashflow</Link>
           <Link href="/reorder" className="hover:text-indigo">Reorder</Link>
+          <Link href="/events" className="hover:text-indigo">Events</Link>
           {email && (
             <span className="text-charcoal/60 ml-4 hidden md:inline">{email}</span>
           )}

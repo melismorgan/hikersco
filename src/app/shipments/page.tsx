@@ -1,22 +1,20 @@
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { Header } from '@/components/Header';
-import { PosView } from '@/components/PosView';
-import { PoPaymentsSection } from '@/components/PoPaymentsSection';
-import { readPos, loadPoSummaries } from '@/lib/inventory';
+import { ShipmentsView } from '@/components/ShipmentsView';
+import { loadPoSummaries } from '@/lib/inventory';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-export default async function PosPage() {
+export default async function ShipmentsPage() {
   const session = await getServerSession(authOptions);
   const email = session?.user?.email ?? null;
 
-  let rows: Awaited<ReturnType<typeof readPos>> = [];
   let summaries: Awaited<ReturnType<typeof loadPoSummaries>> = [];
   let loadError: string | null = null;
   try {
-    [rows, summaries] = await Promise.all([readPos(), loadPoSummaries('all')]);
+    summaries = await loadPoSummaries('all');
   } catch (err) {
     loadError = err instanceof Error ? err.message : String(err);
   }
@@ -24,23 +22,22 @@ export default async function PosPage() {
   return (
     <>
       <Header email={email} />
-      <main className="max-w-[1400px] mx-auto px-6 py-8 space-y-10">
-        <div>
-          <h1 className="text-3xl mb-1">Purchase orders</h1>
+      <main className="max-w-[1400px] mx-auto px-6 py-8">
+        <div className="mb-6">
+          <h1 className="text-3xl mb-1">Shipments</h1>
           <p className="text-sm text-charcoal/60">
-            Live read of the POs tab. Payment summary up top (one row per PO), full line items below.
+            Plan, track, and pay for physical shipments. Each shipment links to a PO,
+            carries a destination warehouse and receiving order ID, and has its own
+            line allocation.
           </p>
         </div>
         {loadError ? (
           <div className="rounded-lg border border-ironclad/40 bg-ironclad/5 p-6">
-            <p className="font-semibold text-ironclad mb-2">Couldn’t load POs.</p>
+            <p className="font-semibold text-ironclad mb-2">Couldn’t load shipments.</p>
             <pre className="text-xs whitespace-pre-wrap">{loadError}</pre>
           </div>
         ) : (
-          <>
-            <PoPaymentsSection summaries={summaries} />
-            <PosView rows={rows} />
-          </>
+          <ShipmentsView summaries={summaries} />
         )}
       </main>
     </>

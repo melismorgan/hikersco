@@ -2,7 +2,8 @@ import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { Header } from '@/components/Header';
 import { AccessoriesGrid } from '@/components/AccessoriesGrid';
-import { loadAccessoriesDashboard, readStyleLines, readStyleSuppliers, getDraftPoSummaries } from '@/lib/inventory';
+import { SyncStatus } from '@/components/SyncStatus';
+import { loadAccessoriesDashboard, readStyleLines, readStyleSuppliers, getDraftPoSummaries, readSyncFreshness } from '@/lib/inventory';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -15,18 +16,21 @@ export default async function AccessoriesPage() {
   let styleLineMap: Record<string, string> = {};
   let styleSupplierMap: Record<string, string> = {};
   let existingDrafts: Awaited<ReturnType<typeof getDraftPoSummaries>> = [];
+  let freshness: Awaited<ReturnType<typeof readSyncFreshness>> = { shipbob: null, amazon: null, velocity: null };
   let loadError: string | null = null;
   try {
-    const [r, sl, ss, ed] = await Promise.all([
+    const [r, sl, ss, ed, fr] = await Promise.all([
       loadAccessoriesDashboard(),
       readStyleLines(),
       readStyleSuppliers(),
       getDraftPoSummaries(),
+      readSyncFreshness(),
     ]);
     rows = r;
     styleLineMap = Object.fromEntries(sl);
     styleSupplierMap = Object.fromEntries(ss);
     existingDrafts = ed;
+    freshness = fr;
   } catch (err) {
     loadError = err instanceof Error ? err.message : String(err);
   }
@@ -46,6 +50,7 @@ export default async function AccessoriesPage() {
             <p className="text-sm text-charcoal/60">
               Non-sized SKUs — Hook Packs, Rear Hooks, Wallets. Sorted by line, then Style → Color.
             </p>
+            <SyncStatus freshness={freshness} />
           </div>
           <div className="flex gap-6 text-sm">
             <Kpi label="SKUs" value={totalSkus.toLocaleString()} />

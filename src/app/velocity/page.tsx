@@ -2,7 +2,8 @@ import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { Header } from '@/components/Header';
 import { VelocityGrid } from '@/components/VelocityGrid';
-import { readVelocityFull, readStyleLines } from '@/lib/inventory';
+import { SyncStatus } from '@/components/SyncStatus';
+import { readVelocityFull, readStyleLines, readSyncFreshness } from '@/lib/inventory';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -13,11 +14,13 @@ export default async function VelocityPage() {
 
   let rows: Awaited<ReturnType<typeof readVelocityFull>> = [];
   let styleLineMap: Record<string, string> = {};
+  let freshness: Awaited<ReturnType<typeof readSyncFreshness>> = { shipbob: null, amazon: null, velocity: null };
   let loadError: string | null = null;
   try {
-    const [r, sl] = await Promise.all([readVelocityFull(), readStyleLines()]);
+    const [r, sl, fr] = await Promise.all([readVelocityFull(), readStyleLines(), readSyncFreshness()]);
     rows = r;
     styleLineMap = Object.fromEntries(sl);
+    freshness = fr;
   } catch (err) {
     loadError = err instanceof Error ? err.message : String(err);
   }
@@ -29,8 +32,9 @@ export default async function VelocityPage() {
         <div className="mb-6">
           <h1 className="text-3xl mb-1">Velocity</h1>
           <p className="text-sm text-charcoal/60">
-            Sales velocity from your Velocity tab — 7d / 30d / 90d windows. Trend sparkline plots 90d → 30d → 7d.
+            Sales velocity from your Velocity tab — Shopify + Amazon, 7d / 30d / 90d windows. Trend sparkline plots 90d → 30d → 7d.
           </p>
+          <SyncStatus freshness={freshness} />
         </div>
         {loadError ? (
           <div className="rounded-lg border border-ironclad/40 bg-ironclad/5 p-6">

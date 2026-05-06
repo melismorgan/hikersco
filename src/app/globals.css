@@ -65,12 +65,28 @@ thead .sticky-sku { z-index: 30; }
  * cells (25), so the top-left corner cell layers correctly when both axes
  * are scrolled.
  */
+/* Why both overflow-x AND overflow-y are 'auto' here, not just x:
+ * The CSS Overflow spec says when overflow-x is set to anything other than
+ * 'visible', overflow-y is forced to 'auto' even if you explicitly write
+ * 'visible'. That created an inner scroll context that broke
+ * viewport-anchored sticky on the table's <th> cells. The fix is to embrace
+ * the inner scroll: give the wrapper a fixed max-height so it becomes a
+ * proper scroll region with sticky cells anchored to ITS top. dvh is used
+ * over vh so the mobile address bar collapsing doesn't change the height.
+ */
 .dash-scroll {
-  overflow-x: auto;
-  overflow-y: visible;
+  overflow: auto;
+  max-height: calc(100dvh - 10rem);
 }
 .dash-table thead th {
   position: sticky;
   top: 0;
   z-index: 25;
+}
+/* Default opaque header background so scrolled-under content doesn't bleed
+ * through the sticky cells. `:where()` keeps specificity at (0,0,0), so any
+ * per-cell `bg-*` Tailwind class on a <Th> overrides this fallback (e.g.
+ * ApparelGrid's bg-warm-tint / bg-[#E6E6E8] header banding). */
+:where(.dash-table thead th) {
+  background-color: #DDE1EE; /* periwinkle wash */
 }

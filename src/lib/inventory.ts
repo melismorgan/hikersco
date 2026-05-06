@@ -40,6 +40,75 @@
  *   D Mode (Air|Sea)           O Source On Hand
  *   E Order Date               P Dest On Hand
  *   F ETA                      Q All-Day Total
+ *
+ * PO Payments (cols A..E) — one row per PO #, holds the PLAN only.
+ *   A PO #
+ *   B Deposit %        (fraction 0..1; default 0.20)
+ *   C Deposit Due Date (when deposit is owed)
+ *   D Balance Due Date (when balance is owed; on staged deliveries this is
+ *                       the first due date — actuals come from transactions)
+ *   E Notes            (free text — Alibaba Trade Assurance # often goes here)
+ *
+ * PO Payment Transactions (cols A..G) — one row per actual money transfer.
+ * A single PO can have N transactions per leg: deposits sometimes split into
+ * 2-3 transfers, balance payments often split across staged deliveries
+ * (pay 50% balance on first container, 50% on second), and shipping payments
+ * land separately when the freight forwarder is paid before shipment.
+ *   A PO #
+ *   B Type        (Deposit | Balance | Shipping)
+ *   C Date        (when the transfer happened)
+ *   D Amount      (principal — what the recipient receives)
+ *   E Fee         (Alibaba/platform fee on this transaction; 0 if none)
+ *   F Notes       (Alibaba TA event ref, batch number, "1 of 3", etc.)
+ *   G Shipment ID (links Shipping txs to a row on the Shipments tab; blank
+ *                  for Deposit/Balance txs and for legacy Shipping txs)
+ *
+ * Type semantics:
+ *   Deposit + Balance — paid to the supplier (RX). Together they cover the
+ *     PO Total (= sum of line items × unit cost). Deposit % applies to PO
+ *     Total, balance is the remainder.
+ *   Shipping — paid to the freight forwarder, separate stream. Has no plan
+ *     amount in v1; tracked as actuals only so we can answer "have we paid
+ *     enough to release the shipment?"
+ *
+ * Fees are intrinsic to each transaction (Alibaba charges a platform fee on
+ * top of the principal). Stored separately so we can roll up TRUE landed
+ * cost = PO Total + Σ Shipping + Σ Fees.
+ *
+ * Computed from transactions in loadPoSummaries:
+ *   depositPaidAmount  = Σ(Type=Deposit  Amount)
+ *   balancePaidAmount  = Σ(Type=Balance  Amount)
+ *   shippingPaidAmount = Σ(Type=Shipping Amount)
+ *   totalFees          = Σ(any-type Fee)
+ *   landedCost         = totalCost + shippingPaidAmount + totalFees
+ *
+ * Note: shipping is NOT entered as a line item on the POs tab — it's only
+ * tracked here. If you want freight in COGS, use landedCost.
+ *
+ * Shipments (cols A..M) — one row per physical shipment leaving RX.
+ *   A Shipment ID         (auto SHP-NNNNN sequential)
+ *   B PO #                (parent PO)
+ *   C Label               (free text — "Air restock to AWD", optional)
+ *   D Mode                (Air | Sea | Truck)
+ *   E Destination         (AWD Storage | ShipBob WI)
+ *   F Departure Date
+ *   G ETA
+ *   H Status              (Planning | In Transit | Received | Cancelled)
+ *   I Carrier             (forwarder name)
+ *   J Tracking #
+ *   K Receiving Order ID  (AWD inbound shipment ID or ShipBob WRO ID)
+ *   L Estimated Cost      (freight quote, optional)
+ *   M Notes
+ *
+ * Shipment Lines (cols A..C) — line-item allocation per shipment. A PO
+ * line item can be split across multiple shipments (e.g. 500 air + 4500 sea).
+ *   A Shipment ID
+ *   B SKU
+ *   C Qty
+ *
+ * A shipment goes to exactly ONE destination. PO splitting AWD + ShipBob
+ * = two shipments. Existing pre-shipments POs (history) don't need backfill;
+ * shipments only apply to new POs going forward.
  */
 
 import { readTab } from './sheets';
@@ -121,6 +190,147 @@ export interface IncomingPoLine {
   eta: string;        // raw string from sheet
   etaTimestamp: number; // Date.parse(eta), or Number.MAX_SAFE_INTEGER if unparsable
   qty: number;
+}
+
+/**
+ * A row on the PO Payments tab — the PLAN per PO #. Actual money transfers
+ * live on the PO Payment Transactions tab (potentially many per PO).
+ */
+export interface PoPaymentRow {
+  /** 1-based sheet row number; header is row 1, first data row is 2.
+   *  Used as the address for in-place edits. */
+  rowIndex: number;
+  poNumber: string;
+  /** Deposit fraction (0..1). 0.20 = 20% deposit / 80% balance. Default 0.20. */
+  depositPct: number;
+  depositDueDate: string;
+  balanceDueDate: string;
+  notes: string;
+}
+
+/** A single payment transaction — one money transfer for a PO. */
+export interface PoPaymentTxn {
+  /** 1-based sheet row number on PO Payment Transactions tab. */
+  rowIndex: number;
+  poNumber: string;
+  type: 'Deposit' | 'Balance' | 'Shipping';
+  date: string;
+  /** Principal — what the recipient (RX or freight forwarder) receives. */
+  amount: number;
+  /** Platform fee on this transaction (Alibaba processing fee, etc.). 0 if none. */
+  fee: number;
+  notes: string;
+  /** Optional link to a Shipment row — only populated for Shipping txs. '' if unassigned. */
+  shipmentId: string;
+}
+
+/** Status enum for a Shipment. */
+export type ShipmentStatus = 'Planning' | 'In Transit' | 'Received' | 'Cancelled';
+
+/** A row on the Shipments tab — one physical shipment leaving RX. */
+export interface Shipment {
+  rowIndex: number;
+  shipmentId: string;
+  poNumber: string;
+  label: string;
+  mode: string;
+  destination: string;
+  departureDate: string;
+  eta: string;
+  status: ShipmentStatus | '';
+  carrier: string;
+  trackingNumber: string;
+  receivingOrderId: string;
+  estimatedCost: number;
+  notes: string;
+  /** Lines allocated to this shipment (joined from Shipment Lines tab). */
+  lines: ShipmentLine[];
+  /** Σ Shipping-type transactions linked to this shipment. */
+  shippingPaidAmount: number;
+  /** # of Shipping transactions linked to this shipment. */
+  shippingTxnCount: number;
+  /** Σ Fee on Shipping transactions linked to this shipment. */
+  shippingFees: number;
+}
+
+/** One allocated line on a shipment. */
+export interface ShipmentLine {
+  rowIndex: number;
+  shipmentId: string;
+  sku: string;
+  qty: number;
+}
+
+/** Derived payment status — never stored, always computed from paid dates +
+ *  the rolled-up Status of the PO's line items. */
+export type PaymentStatus =
+  | 'Pending Deposit'
+  | 'Awaiting Balance'
+  | 'Paid In Full'
+  | 'Cancelled';
+
+/**
+ * Per-PO summary — one entity per PO #, joining the line-item rollup with
+ * the PO Payments tab. Drives /pos summary view and /cashflow.
+ */
+export interface PoSummary {
+  poNumber: string;
+  /** Rolled-up PO status. If all lines Cancelled → Cancelled; else "most
+   *  advanced" non-Cancelled status across lines (Received > Incoming >
+   *  Draft). Mixed states stay readable in the line table below. */
+  status: string;
+  supplier: string;
+  /** Most-common Mode across lines, or '' if mixed/blank. */
+  mode: string;
+  orderDate: string;
+  /** Earliest non-blank ETA across lines (ETAs may differ on multi-leg POs). */
+  eta: string;
+  lineCount: number;
+  totalUnits: number;
+  /** sum(line.qty × line.unitCost) across all lines. */
+  totalCost: number;
+  // Payment fields — present whether or not a PO Payments row exists yet.
+  depositPct: number;
+  depositAmount: number;
+  balanceAmount: number;
+  depositDueDate: string;
+  /** Latest Deposit transaction date, or '' if none. */
+  depositPaidDate: string;
+  /** Σ Deposit-type transaction Amount for this PO. */
+  depositPaidAmount: number;
+  balanceDueDate: string;
+  /** Latest Balance transaction date, or '' if none. */
+  balancePaidDate: string;
+  /** Σ Balance-type transaction Amount. */
+  balancePaidAmount: number;
+  /** Remaining unpaid (max(expected − paid, 0)) — drives Cashflow. */
+  depositRemaining: number;
+  balanceRemaining: number;
+  // Shipping (no plan amount in v1 — actuals only)
+  /** Σ Shipping-type transaction Amount. */
+  shippingPaidAmount: number;
+  /** Latest Shipping transaction date, or '' if none. */
+  shippingPaidDate: string;
+  // Fees (Alibaba platform fees, etc.) — rolled up for landed-cost accuracy
+  depositFees: number;
+  balanceFees: number;
+  shippingFees: number;
+  /** Σ Fee across all transactions of any type. */
+  totalFees: number;
+  /** True landed cost = PO Total (product) + shipping paid + total fees. */
+  landedCost: number;
+  paymentStatus: PaymentStatus;
+  paymentNotes: string;
+  /** True when there's no row in the PO Payments tab yet — UI uses this to
+   *  surface a "set defaults" affordance on first edit. */
+  paymentRowExists: boolean;
+  /** All transactions for this PO, sorted by date (earliest first). */
+  transactions: PoPaymentTxn[];
+  /** All shipments for this PO, sorted by Shipment ID (creation order). */
+  shipments: Shipment[];
+  /** The PO's line items (SKU + qty + supplier/dest/mode/etc) — used by the
+   *  shipment allocation editor so it knows what's available to ship. */
+  lineRows: PoRow[];
 }
 
 /** A single PO line as stored on the POs tab. */
@@ -363,6 +573,59 @@ export async function readVelocityFull(): Promise<VelocityFull[]> {
   })).filter((r) => r.sku);
 }
 
+/**
+ * Per-source last-synced timestamps for the freshness indicator on the
+ * dashboards. Each value is the raw cell content from row 2 of the
+ * corresponding feed (Apps Script writes a Date there, which Sheets
+ * serializes as an ISO-ish string we can pass straight to the client).
+ */
+export interface SyncFreshness {
+  shipbob: string | null;
+  amazon: string | null;
+  velocity: string | null;
+}
+
+/**
+ * Read the "Last Synced" timestamp from each feed. Each feed is fully
+ * rewritten in one shot by its sync job, so all rows carry the same
+ * timestamp — we just read row 2 (the first data row) of each tab.
+ *
+ * Robust to schema drift: locates the timestamp column by header name
+ * rather than fixed index, since Shipbob Feed has a dynamic column
+ * count that depends on how many fulfillment centers report data.
+ */
+export async function readSyncFreshness(): Promise<SyncFreshness> {
+  const findTimestamp = async (tabName: string, headerNeedles: string[]): Promise<string | null> => {
+    try {
+      const grid = await readTab(tabName);
+      if (grid.length < 2) return null;
+      const header = (grid[0] || []).map((h) => String(h ?? '').trim().toLowerCase());
+      let idx = -1;
+      for (const needle of headerNeedles) {
+        idx = header.findIndex((h) => h === needle.toLowerCase());
+        if (idx !== -1) break;
+      }
+      if (idx === -1) return null;
+      // Walk down looking for the first row that actually has a timestamp —
+      // some tabs (Velocity) have line-banner rows interspersed with data.
+      for (let i = 1; i < grid.length; i++) {
+        const v = grid[i]?.[idx];
+        if (v != null && String(v).trim() !== '') return String(v);
+      }
+      return null;
+    } catch {
+      // Tab missing or API error — treat as "no data", don't fail the page.
+      return null;
+    }
+  };
+  const [shipbob, amazon, velocity] = await Promise.all([
+    findTimestamp('Shipbob Feed', ['Last Synced']),
+    findTimestamp('Amazon Feed', ['Last Synced']),
+    findTimestamp('Velocity', ['Last Sync', 'Last Synced']),
+  ]);
+  return { shipbob, amazon, velocity };
+}
+
 /** Lightweight summary of an existing Draft PO group, used by the
  *  "add to existing draft" picker in the dashboard's Push flow. */
 export interface DraftPoSummary {
@@ -429,6 +692,345 @@ export async function readPos(): Promise<PoRow[]> {
     source:       str(r[12]),
     dest:         str(r[13]),
   })).filter((r) => r.sku || r.poNumber); // skip fully blank rows
+}
+
+/** Default deposit fraction when a PO has no payment record yet. */
+export const DEFAULT_DEPOSIT_PCT = 0.20;
+
+/**
+ * Read the PO Payments tab (the PLAN). Tab is optional — if missing/empty,
+ * returns an empty map and the summary builder falls back to defaults
+ * (20% deposit, no due dates) for every PO.
+ */
+export async function readPoPayments(): Promise<Map<string, PoPaymentRow>> {
+  const out = new Map<string, PoPaymentRow>();
+  let grid: string[][];
+  try {
+    grid = await readTab('PO Payments');
+  } catch {
+    return out; // Tab not created yet
+  }
+  if (grid.length < 2) return out;
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    const poNumber = str(r[0]);
+    if (!poNumber) continue;
+    // Stored as 0..1 (0.20 = 20%) OR 0..100 (20 = 20%). Coerce both safely.
+    let depositPct = num(r[1]);
+    if (depositPct > 1) depositPct = depositPct / 100;
+    if (!(depositPct > 0 && depositPct < 1)) depositPct = DEFAULT_DEPOSIT_PCT;
+    out.set(poNumber, {
+      rowIndex: i + 1,
+      poNumber,
+      depositPct,
+      depositDueDate: str(r[2]),
+      balanceDueDate: str(r[3]),
+      notes:          str(r[4]),
+    });
+  }
+  return out;
+}
+
+/**
+ * Read the PO Payment Transactions tab. Returns transactions grouped by
+ * PO #, sorted within each group by date (earliest first). Missing/empty
+ * tab returns an empty map.
+ */
+export async function readPoPaymentTransactions(): Promise<Map<string, PoPaymentTxn[]>> {
+  const out = new Map<string, PoPaymentTxn[]>();
+  let grid: string[][];
+  try {
+    grid = await readTab('PO Payment Transactions');
+  } catch {
+    return out;
+  }
+  if (grid.length < 2) return out;
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    const poNumber = str(r[0]);
+    const typeRaw  = str(r[1]);
+    if (!poNumber || !typeRaw) continue;
+    // Normalize type — accept any case ('deposit'/'DEPOSIT'/'Deposit').
+    const tl = typeRaw.toLowerCase();
+    const type: PoPaymentTxn['type'] | null =
+      tl.startsWith('dep')  ? 'Deposit' :
+      tl.startsWith('bal')  ? 'Balance' :
+      tl.startsWith('ship') ? 'Shipping' :
+      null;
+    if (!type) continue;
+    const tx: PoPaymentTxn = {
+      rowIndex:   i + 1,
+      poNumber,
+      type,
+      date:       str(r[2]),
+      amount:     num(r[3]),
+      fee:        num(r[4]),
+      notes:      str(r[5]),
+      shipmentId: str(r[6]),
+    };
+    if (!out.has(poNumber)) out.set(poNumber, []);
+    out.get(poNumber)!.push(tx);
+  }
+  // Stable sort: earliest date first, then row index for ties.
+  for (const list of out.values()) {
+    list.sort((a, b) => {
+      const at = Date.parse(a.date);
+      const bt = Date.parse(b.date);
+      const av = Number.isFinite(at) ? at : Number.MAX_SAFE_INTEGER;
+      const bv = Number.isFinite(bt) ? bt : Number.MAX_SAFE_INTEGER;
+      if (av !== bv) return av - bv;
+      return a.rowIndex - b.rowIndex;
+    });
+  }
+  return out;
+}
+
+/**
+ * Read the Shipments tab. Optional — returns empty map if missing.
+ * Each row maps to one Shipment record (lines populated separately).
+ */
+export async function readShipments(): Promise<Map<string, Shipment>> {
+  const out = new Map<string, Shipment>();
+  let grid: string[][];
+  try {
+    grid = await readTab('Shipments');
+  } catch {
+    return out;
+  }
+  if (grid.length < 2) return out;
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    const shipmentId = str(r[0]);
+    if (!shipmentId) continue;
+    const statusRaw = str(r[7]);
+    const status: ShipmentStatus | '' =
+      statusRaw === 'Planning'   ? 'Planning' :
+      statusRaw === 'In Transit' ? 'In Transit' :
+      statusRaw === 'Received'   ? 'Received' :
+      statusRaw === 'Cancelled'  ? 'Cancelled' : '';
+    out.set(shipmentId, {
+      rowIndex: i + 1,
+      shipmentId,
+      poNumber:         str(r[1]),
+      label:            str(r[2]),
+      mode:             str(r[3]),
+      destination:      str(r[4]),
+      departureDate:    str(r[5]),
+      eta:              str(r[6]),
+      status,
+      carrier:          str(r[8]),
+      trackingNumber:   str(r[9]),
+      receivingOrderId: str(r[10]),
+      estimatedCost:    num(r[11]),
+      notes:            str(r[12]),
+      lines: [],
+      shippingPaidAmount: 0,
+      shippingTxnCount: 0,
+      shippingFees: 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * Read the Shipment Lines tab and return lines grouped by Shipment ID.
+ * Optional — returns empty map if missing.
+ */
+export async function readShipmentLines(): Promise<Map<string, ShipmentLine[]>> {
+  const out = new Map<string, ShipmentLine[]>();
+  let grid: string[][];
+  try {
+    grid = await readTab('Shipment Lines');
+  } catch {
+    return out;
+  }
+  if (grid.length < 2) return out;
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    const shipmentId = str(r[0]);
+    const sku        = str(r[1]);
+    if (!shipmentId || !sku) continue;
+    const line: ShipmentLine = {
+      rowIndex: i + 1,
+      shipmentId,
+      sku,
+      qty: num(r[2]),
+    };
+    if (!out.has(shipmentId)) out.set(shipmentId, []);
+    out.get(shipmentId)!.push(line);
+  }
+  return out;
+}
+
+/**
+ * Group PO line items by PO# and return one PoSummary per PO. Joins the
+ * line-item rollup (totals, supplier, dates) with the PO Payments tab.
+ *
+ * Skips internal transfers — those don't represent vendor payments.
+ *
+ * @param scope 'all' (default) returns every PO. 'open' filters to POs with
+ *   non-Cancelled lines (drives the cashflow forecast).
+ */
+export async function loadPoSummaries(
+  scope: 'all' | 'open' = 'all',
+): Promise<PoSummary[]> {
+  const [lines, payments, txns, shipmentsById, shipmentLinesById] = await Promise.all([
+    readPos(),
+    readPoPayments(),
+    readPoPaymentTransactions(),
+    readShipments(),
+    readShipmentLines(),
+  ]);
+
+  // Pre-attach lines to each shipment, and pre-bucket shipments by PO #
+  // so we can spread them into PoSummary cheaply.
+  const shipmentsByPo = new Map<string, Shipment[]>();
+  for (const s of shipmentsById.values()) {
+    s.lines = shipmentLinesById.get(s.shipmentId) ?? [];
+    if (!shipmentsByPo.has(s.poNumber)) shipmentsByPo.set(s.poNumber, []);
+    shipmentsByPo.get(s.poNumber)!.push(s);
+  }
+  for (const list of shipmentsByPo.values()) {
+    list.sort((a, b) => a.shipmentId.localeCompare(b.shipmentId));
+  }
+
+  interface Group {
+    lines: PoRow[];
+    statuses: Set<string>;
+    suppliers: Map<string, number>;
+    modes: Map<string, number>;
+    orderDates: string[];
+    etas: string[];
+  }
+  const groups = new Map<string, Group>();
+  for (const l of lines) {
+    if (!l.poNumber) continue;
+    if ((l.type || '').toLowerCase() === 'internal transfer') continue;
+    let g = groups.get(l.poNumber);
+    if (!g) {
+      g = {
+        lines: [], statuses: new Set(), suppliers: new Map(), modes: new Map(),
+        orderDates: [], etas: [],
+      };
+      groups.set(l.poNumber, g);
+    }
+    g.lines.push(l);
+    if (l.status) g.statuses.add(l.status);
+    if (l.supplier) g.suppliers.set(l.supplier, (g.suppliers.get(l.supplier) ?? 0) + 1);
+    if (l.mode)     g.modes.set(l.mode,         (g.modes.get(l.mode)     ?? 0) + 1);
+    if (l.orderDate) g.orderDates.push(l.orderDate);
+    if (l.eta)       g.etas.push(l.eta);
+  }
+
+  // "Most advanced" status — Received > Incoming > Draft > Cancelled.
+  const STATUS_RANK: Record<string, number> = { Received: 4, Incoming: 3, Draft: 2, Cancelled: 1 };
+  function rollupStatus(statuses: Set<string>): string {
+    if (statuses.size === 0) return '';
+    // If every line is Cancelled, the PO is Cancelled.
+    if (statuses.size === 1 && statuses.has('Cancelled')) return 'Cancelled';
+    // Otherwise pick the most-advanced non-Cancelled state.
+    let best = '';
+    let bestRank = 0;
+    for (const s of statuses) {
+      if (s === 'Cancelled') continue;
+      const r = STATUS_RANK[s] ?? 0;
+      if (r > bestRank) { bestRank = r; best = s; }
+    }
+    return best || [...statuses][0]!;
+  }
+
+  const summaries: PoSummary[] = [];
+  for (const [poNumber, g] of groups) {
+    const status = rollupStatus(g.statuses);
+    if (scope === 'open' && status === 'Cancelled') continue;
+
+    const totalUnits = g.lines.reduce((s, l) => s + l.qty, 0);
+    const totalCost  = g.lines.reduce((s, l) => s + l.qty * l.unitCost, 0);
+    const supplier   = [...g.suppliers.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
+    const modeWinner = [...g.modes.entries()].sort((a, b) => b[1] - a[1])[0];
+    // If multiple modes appear (split air/sea PO), leave blank rather than picking one.
+    const mode = modeWinner && g.modes.size === 1 ? modeWinner[0] : '';
+    const orderDate = g.orderDates.sort()[0] ?? '';
+    const eta       = g.etas.sort()[0] ?? '';
+
+    const pay = payments.get(poNumber);
+    const depositPct  = pay?.depositPct ?? DEFAULT_DEPOSIT_PCT;
+    const depositAmount = totalCost * depositPct;
+    const balanceAmount = Math.max(totalCost - depositAmount, 0);
+
+    // Aggregate transactions by leg. Sum amounts and fees; latest date is
+    // the most recent transaction date per leg (poTxns is sorted by date
+    // ascending so the LAST matching item is "latest").
+    const poTxns = txns.get(poNumber) ?? [];
+    let depositPaidAmount = 0,  balancePaidAmount = 0,  shippingPaidAmount = 0;
+    let depositFees       = 0,  balanceFees       = 0,  shippingFees       = 0;
+    let depositPaidDate   = '', balancePaidDate   = '', shippingPaidDate   = '';
+    for (const t of poTxns) {
+      if (t.type === 'Deposit') {
+        depositPaidAmount += t.amount;
+        depositFees       += t.fee;
+        if (t.date) depositPaidDate = t.date;
+      } else if (t.type === 'Balance') {
+        balancePaidAmount += t.amount;
+        balanceFees       += t.fee;
+        if (t.date) balancePaidDate = t.date;
+      } else if (t.type === 'Shipping') {
+        shippingPaidAmount += t.amount;
+        shippingFees       += t.fee;
+        if (t.date) shippingPaidDate = t.date;
+        // Roll the tx into its linked shipment, if any. Unassigned shipping
+        // txs (legacy, or freight forwarder paid before shipment was logged)
+        // still count toward PO totals but won't show on a shipment.
+        if (t.shipmentId) {
+          const sh = shipmentsById.get(t.shipmentId);
+          if (sh) {
+            sh.shippingPaidAmount += t.amount;
+            sh.shippingFees       += t.fee;
+            sh.shippingTxnCount   += 1;
+          }
+        }
+      }
+    }
+    const totalFees = depositFees + balanceFees + shippingFees;
+    const landedCost = totalCost + shippingPaidAmount + totalFees;
+
+    const EPS = 0.005; // half-cent slop to absorb rounding noise
+    const depositFullyPaid = depositPaidAmount >= depositAmount - EPS;
+    const balanceFullyPaid = balancePaidAmount >= balanceAmount - EPS;
+    const depositRemaining = Math.max(depositAmount - depositPaidAmount, 0);
+    const balanceRemaining = Math.max(balanceAmount - balancePaidAmount, 0);
+
+    let paymentStatus: PaymentStatus;
+    if (status === 'Cancelled')             paymentStatus = 'Cancelled';
+    else if (balanceFullyPaid && depositFullyPaid) paymentStatus = 'Paid In Full';
+    else if (depositFullyPaid)              paymentStatus = 'Awaiting Balance';
+    else                                     paymentStatus = 'Pending Deposit';
+
+    summaries.push({
+      poNumber, status, supplier, mode, orderDate, eta,
+      lineCount: g.lines.length,
+      totalUnits, totalCost,
+      depositPct, depositAmount, balanceAmount,
+      depositDueDate: pay?.depositDueDate ?? '',
+      depositPaidDate, depositPaidAmount,
+      balanceDueDate: pay?.balanceDueDate ?? '',
+      balancePaidDate, balancePaidAmount,
+      depositRemaining, balanceRemaining,
+      shippingPaidAmount, shippingPaidDate,
+      depositFees, balanceFees, shippingFees, totalFees,
+      landedCost,
+      paymentStatus,
+      paymentNotes: pay?.notes ?? '',
+      paymentRowExists: !!pay,
+      transactions: poTxns,
+      shipments: shipmentsByPo.get(poNumber) ?? [],
+      lineRows: g.lines,
+    });
+  }
+
+  // Most recent first by PO# — RX-NNNNN sorts naturally.
+  summaries.sort((a, b) => b.poNumber.localeCompare(a.poNumber));
+  return summaries;
 }
 
 /**
