@@ -112,6 +112,7 @@
  */
 
 import { readTab } from './sheets';
+import { lineOrderIndex } from './line-order';
 
 // ---- Row types --------------------------------------------------------------
 
@@ -331,6 +332,19 @@ export interface PoSummary {
   /** The PO's line items (SKU + qty + supplier/dest/mode/etc) — used by the
    *  shipment allocation editor so it knows what's available to ship. */
   lineRows: PoRow[];
+  /** SKU → ordering metadata for the shipment allocation editor.
+   *  When destination = ShipBob WI, the editor sorts SKUs by style → color →
+   *  sizeOrder (matches the Apparel dashboard ordering). When = AWD Storage,
+   *  alphabetical by SKU. Plain object (not Map) so it serializes cleanly
+   *  across the server→client boundary. */
+  skuMeta: Record<string, {
+    style: string;
+    color: string;
+    line: string;
+    lineOrder: number;
+    size: string;
+    sizeOrder: number;
+  }>;
 }
 
 /** A single PO line as stored on the POs tab. */
@@ -718,7 +732,9 @@ export async function readPoPayments(): Promise<Map<string, PoPaymentRow>> {
     // Stored as 0..1 (0.20 = 20%) OR 0..100 (20 = 20%). Coerce both safely.
     let depositPct = num(r[1]);
     if (depositPct > 1) depositPct = depositPct / 100;
-    if (!(depositPct > 0 && depositPct < 1)) depositPct = DEFAULT_DEPOSIT_PCT;
+    // Allow exactly 1.0 (100% deposit) for paid-at-order POs like hook-only
+    // accessories. Reject only values outside (0, 1] or non-finite.
+    if (!(depositPct > 0 && depositPct <= 1)) depositPct = DEFAULT_DEPOSIT_PCT;
     out.set(poNumber, {
       rowIndex: i + 1,
       poNumber,
@@ -874,13 +890,33 @@ export async function readShipmentLines(): Promise<Map<string, ShipmentLine[]>> 
 export async function loadPoSummaries(
   scope: 'all' | 'open' = 'all',
 ): Promise<PoSummary[]> {
-  const [lines, payments, txns, shipmentsById, shipmentLinesById] = await Promise.all([
+  const [lines, payments, txns, shipmentsById, shipmentLinesById, skuMaster, styleLines] = await Promise.all([
     readPos(),
     readPoPayments(),
     readPoPaymentTransactions(),
     readShipments(),
     readShipmentLines(),
+    readSkuMaster(),
+    readStyleLines(),
   ]);
+
+  // Build a SKU → ordering meta map once. Used by every PoSummary so the
+  // shipment allocation editor can sort by Style → Color → Size when shipping
+  // to ShipBob WI (matches the Apparel dashboard ordering).
+  const skuMetaAll: Record<string, {
+    style: string; color: string; line: string; lineOrder: number; size: string; sizeOrder: number;
+  }> = {};
+  for (const m of skuMaster) {
+    const line = styleLines.get(m.style) ?? '';
+    skuMetaAll[m.sku] = {
+      style: m.style,
+      color: m.color,
+      line,
+      lineOrder: lineOrderIndex(line),
+      size: m.size,
+      sizeOrder: m.sizeOrder,
+    };
+  }
 
   // Pre-attach lines to each shipment, and pre-bucket shipments by PO #
   // so we can spread them into PoSummary cheaply.
@@ -944,8 +980,13 @@ export async function loadPoSummaries(
     const status = rollupStatus(g.statuses);
     if (scope === 'open' && status === 'Cancelled') continue;
 
-    const totalUnits = g.lines.reduce((s, l) => s + l.qty, 0);
-    const totalCost  = g.lines.reduce((s, l) => s + l.qty * l.unitCost, 0);
+    // Cancelled lines should not count toward the PO's monetary total or
+    // unit count — they were ordered then cancelled. Including them inflates
+    // both the PO Total and the derived deposit/balance amounts (see
+    // RX-24036's $80 of cancelled hooks → $16 phantom deposit overdue).
+    const activeLines = g.lines.filter((l) => l.status !== 'Cancelled');
+    const totalUnits = activeLines.reduce((s, l) => s + l.qty, 0);
+    const totalCost  = activeLines.reduce((s, l) => s + l.qty * l.unitCost, 0);
     const supplier   = [...g.suppliers.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
     const modeWinner = [...g.modes.entries()].sort((a, b) => b[1] - a[1])[0];
     // If multiple modes appear (split air/sea PO), leave blank rather than picking one.
@@ -1025,6 +1066,17 @@ export async function loadPoSummaries(
       transactions: poTxns,
       shipments: shipmentsByPo.get(poNumber) ?? [],
       lineRows: g.lines,
+      // Slim the global meta map down to just the SKUs on this PO so the
+      // serialized payload doesn't carry every SKU's ordering fields.
+      skuMeta: (() => {
+        const out: Record<string, {
+          style: string; color: string; line: string; lineOrder: number; size: string; sizeOrder: number;
+        }> = {};
+        for (const r of g.lines) {
+          if (r.sku && skuMetaAll[r.sku]) out[r.sku] = skuMetaAll[r.sku];
+        }
+        return out;
+      })(),
     });
   }
 
@@ -1399,4 +1451,197 @@ export async function loadSkuDetail(sku: string): Promise<SkuDetail | null> {
     daysCover: daysCover(totalOnHand + inTransitAir + inTransitSea, draftPo, avgPerDay30d),
     unitCost: r.unitCost,
   };
+}
+
+// ============================================================================
+// LANDED COST
+// ============================================================================
+//
+// Per-SKU blended landed cost computed from Received POs + their shipping
+// and fee transactions. Allocation = pro-rata by line value (qty × unit_cost).
+// Aggregation = weighted average across all Received POs containing this SKU.
+//
+// Currently includes EXW + Freight + Alibaba Fees. Duty per unit and 3PL
+// inbound per unit are placeholders (always 0) until those data sources
+// are ingested in a separate workstream.
+
+/** A single Received-PO contribution to a SKU's blended landed cost. */
+export interface LandedCostContribution {
+  poNumber: string;
+  receivedDate: string;
+  qty: number;
+  unitCost: number;
+  lineValue: number;        // qty * unitCost
+  poGoodsValue: number;     // total goods value of all Received lines in this PO
+  valueShare: number;       // lineValue / poGoodsValue, 0..1
+  poShipping: number;       // sum of Type=Shipping principal for this PO
+  poFees: number;           // sum of Fee across all transaction types for this PO
+  freightAlloc: number;     // valueShare * poShipping
+  feesAlloc: number;        // valueShare * poFees
+}
+
+/** Per-SKU landed cost row. */
+export interface LandedCostRow {
+  sku: string;
+  // SKU Master metadata (joined for line/Style+Color rollup in the dashboard).
+  // Empty strings if the SKU isn't in SKU Master (shouldn't happen but defensive).
+  style: string;
+  color: string;
+  size: string;
+  category: string;
+  productTitle: string;
+  active: boolean;
+  unitsReceived: number;
+  exwValue: number;          // total EXW spend across all contributing POs
+  exwUnitCost: number;       // weighted avg = exwValue / unitsReceived
+  freightTotal: number;
+  freightPerUnit: number;
+  feesTotal: number;
+  feesPerUnit: number;
+  dutyPerUnit: number;       // 0 placeholder
+  threePLPerUnit: number;    // 0 placeholder
+  totalLandedCost: number;   // exwUnitCost + freightPerUnit + feesPerUnit + ...
+  poCount: number;
+  lastReceived: string;
+  contributions: LandedCostContribution[];
+}
+
+export async function loadLandedCost(): Promise<LandedCostRow[]> {
+  const [poRows, txnsByPo, skuMaster] = await Promise.all([
+    readPos(),
+    readPoPaymentTransactions(),
+    readSkuMaster(),
+  ]);
+  const skuMetaBySku = new Map(skuMaster.map((m) => [m.sku, m]));
+
+  // Two groupings:
+  //   • allLinesByPo  = ALL non-Cancelled lines (used as the allocation denominator,
+  //     so partially-received POs allocate freight against the FULL PO goods value
+  //     not just the received portion — otherwise per-unit freight gets wildly
+  //     inflated for SKUs in POs where only an air-shipment subset has arrived).
+  //   • receivedLinesByPo = only Received lines (these become the SKUs we surface
+  //     in the output — we only show landed cost for inventory we actually have).
+  const allLinesByPo = new Map<string, PoRow[]>();
+  const receivedLinesByPo = new Map<string, PoRow[]>();
+  for (const r of poRows) {
+    if (!r.poNumber || !r.sku) continue;
+    if (r.qty <= 0 || r.unitCost <= 0) continue;
+    if ((r.type || '').toLowerCase() === 'internal transfer') continue;
+    if (r.status === 'Cancelled') continue;
+    if (!allLinesByPo.has(r.poNumber)) allLinesByPo.set(r.poNumber, []);
+    allLinesByPo.get(r.poNumber)!.push(r);
+    if (r.status === 'Received') {
+      if (!receivedLinesByPo.has(r.poNumber)) receivedLinesByPo.set(r.poNumber, []);
+      receivedLinesByPo.get(r.poNumber)!.push(r);
+    }
+  }
+
+  // Per PO totals: shipping principal + total fees across all txn types
+  function poTotals(poNumber: string): { shipping: number; fees: number } {
+    const txns = txnsByPo.get(poNumber) ?? [];
+    let shipping = 0, fees = 0;
+    for (const t of txns) {
+      if (t.type === 'Shipping') shipping += t.amount;
+      fees += t.fee;
+    }
+    return { shipping, fees };
+  }
+
+  // Aggregate per SKU
+  interface Agg {
+    units: number;
+    exwValue: number;
+    freightAlloc: number;
+    feesAlloc: number;
+    poSet: Set<string>;
+    lastReceived: string;
+    contributions: LandedCostContribution[];
+  }
+  const skuAgg = new Map<string, Agg>();
+
+  for (const [poNumber, receivedLines] of receivedLinesByPo) {
+    const allLines = allLinesByPo.get(poNumber) ?? receivedLines;
+    // Denominator = FULL PO goods value (Received + Incoming, ex-Cancelled).
+    // Numerators = received line values. This way each received SKU picks up
+    // its proportional slice of freight + fees, regardless of whether the
+    // rest of the PO has arrived yet.
+    const poGoodsValue = allLines.reduce((s, l) => s + l.qty * l.unitCost, 0);
+    if (poGoodsValue <= 0) continue;
+    const { shipping: poShipping, fees: poFees } = poTotals(poNumber);
+
+    for (const l of receivedLines) {
+      const lineValue = l.qty * l.unitCost;
+      const valueShare = lineValue / poGoodsValue;
+      const freightAlloc = valueShare * poShipping;
+      const feesAlloc = valueShare * poFees;
+
+      let agg = skuAgg.get(l.sku);
+      if (!agg) {
+        agg = {
+          units: 0, exwValue: 0, freightAlloc: 0, feesAlloc: 0,
+          poSet: new Set(), lastReceived: '', contributions: [],
+        };
+        skuAgg.set(l.sku, agg);
+      }
+      agg.units += l.qty;
+      agg.exwValue += lineValue;
+      agg.freightAlloc += freightAlloc;
+      agg.feesAlloc += feesAlloc;
+      agg.poSet.add(poNumber);
+      if (l.receivedDate && l.receivedDate > agg.lastReceived) {
+        agg.lastReceived = l.receivedDate;
+      }
+      agg.contributions.push({
+        poNumber,
+        receivedDate: l.receivedDate || '',
+        qty: l.qty,
+        unitCost: l.unitCost,
+        lineValue,
+        poGoodsValue,
+        valueShare,
+        poShipping,
+        poFees,
+        freightAlloc,
+        feesAlloc,
+      });
+    }
+  }
+
+  // Build output, sorted by SKU
+  const out: LandedCostRow[] = [];
+  for (const [sku, agg] of skuAgg) {
+    const exwUnitCost = agg.exwValue / agg.units;
+    const freightPerUnit = agg.freightAlloc / agg.units;
+    const feesPerUnit = agg.feesAlloc / agg.units;
+    const dutyPerUnit = 0;
+    const threePLPerUnit = 0;
+    const totalLandedCost = exwUnitCost + freightPerUnit + feesPerUnit + dutyPerUnit + threePLPerUnit;
+    // Sort contributions by date desc so the latest PO shows first when expanded
+    agg.contributions.sort((a, b) => (b.receivedDate || '').localeCompare(a.receivedDate || ''));
+    const meta = skuMetaBySku.get(sku);
+    out.push({
+      sku,
+      style: meta?.style ?? '',
+      color: meta?.color ?? '',
+      size: meta?.size ?? '',
+      category: meta?.category ?? '',
+      productTitle: meta?.productTitle ?? '',
+      active: meta?.active ?? false,
+      unitsReceived: agg.units,
+      exwValue: agg.exwValue,
+      exwUnitCost,
+      freightTotal: agg.freightAlloc,
+      freightPerUnit,
+      feesTotal: agg.feesAlloc,
+      feesPerUnit,
+      dutyPerUnit,
+      threePLPerUnit,
+      totalLandedCost,
+      poCount: agg.poSet.size,
+      lastReceived: agg.lastReceived,
+      contributions: agg.contributions,
+    });
+  }
+  out.sort((a, b) => a.sku.localeCompare(b.sku));
+  return out;
 }
