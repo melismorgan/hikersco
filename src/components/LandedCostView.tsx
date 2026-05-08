@@ -559,7 +559,7 @@ function recomputeFromContributions(
   base: RowWithLine,
   contribs: LandedCostContribution[],
 ): RowWithLine {
-  let units = 0, exwValue = 0, freightTotal = 0, feesTotal = 0;
+  let units = 0, exwValue = 0, freightTotal = 0, feesTotal = 0, threePLTotal = 0;
   const poSet = new Set<string>();
   let lastReceived = '';
   for (const c of contribs) {
@@ -567,12 +567,14 @@ function recomputeFromContributions(
     exwValue += c.lineValue;
     freightTotal += c.freightAlloc;
     feesTotal += c.feesAlloc;
+    threePLTotal += c.threePLAlloc;
     poSet.add(c.poNumber);
     if (c.receivedDate && c.receivedDate > lastReceived) lastReceived = c.receivedDate;
   }
   const exwUnitCost = units > 0 ? exwValue / units : 0;
   const freightPerUnit = units > 0 ? freightTotal / units : 0;
   const feesPerUnit = units > 0 ? feesTotal / units : 0;
+  const threePLPerUnit = units > 0 ? threePLTotal / units : 0;
   return {
     ...base,
     contributions: contribs,
@@ -583,7 +585,9 @@ function recomputeFromContributions(
     freightPerUnit,
     feesTotal,
     feesPerUnit,
-    totalLandedCost: exwUnitCost + freightPerUnit + feesPerUnit + base.dutyPerUnit + base.threePLPerUnit,
+    threePLTotal,
+    threePLPerUnit,
+    totalLandedCost: exwUnitCost + freightPerUnit + feesPerUnit + base.dutyPerUnit + threePLPerUnit,
     poCount: poSet.size,
     lastReceived,
   };

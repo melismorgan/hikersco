@@ -57,9 +57,24 @@ export function ShipmentEditor({
     return m;
   }, [shipment]);
 
+  // Already-allocated to OTHER shipments on this PO (i.e. excluding the
+  // shipment we're editing). Used to compute "remaining to allocate" per
+  // SKU so the Fill Empty Rows shortcut doesn't propose more than is left.
+  const otherAllocated = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const sh of po.shipments) {
+      if (shipment && sh.shipmentId === shipment.shipmentId) continue;
+      for (const l of sh.lines) {
+        m.set(l.sku, (m.get(l.sku) ?? 0) + l.qty);
+      }
+    }
+    return m;
+  }, [po.shipments, shipment]);
+
   // Group PO line rows by SKU (same SKU may appear twice — Amz vs SB legs).
-  // For allocation, we sum the line qtys per SKU and let the user split how
-  // they want; the original Dest is shown as a hint only.
+  // We sum the line qtys per SKU and let the user split how they want; the
+  // original Dest is shown as a hint only. Sorted by destination convention:
+  // ShipBob → Line order then size order (matches dashboard); AWD → alpha.
   const skuRows = useMemo(() => {
     const m = new Map<string, { sku: string; totalQty: number; dests: string[] }>();
     for (const r of po.lineRows) {
@@ -72,8 +87,30 @@ export function ShipmentEditor({
         m.set(r.sku, { sku: r.sku, totalQty: r.qty, dests: r.dest ? [r.dest] : [] });
       }
     }
-    return Array.from(m.values()).sort((a, b) => a.sku.localeCompare(b.sku));
-  }, [po.lineRows]);
+    const arr = Array.from(m.values());
+    if (destination === 'ShipBob WI') {
+      // Style alpha → Color alpha → Size order, matching the Apparel
+      // dashboard. e.g. H501-2-BK XS,S,M,L,...,4X then H501-2-GYBK XS,S,...
+      arr.sort((a, b) => {
+        const ma = po.skuMeta[a.sku];
+        const mb = po.skuMeta[b.sku];
+        const styleA = ma?.style ?? '';
+        const styleB = mb?.style ?? '';
+        if (styleA !== styleB) return styleA.localeCompare(styleB);
+        const colorA = ma?.color ?? '';
+        const colorB = mb?.color ?? '';
+        if (colorA !== colorB) return colorA.localeCompare(colorB);
+        const sa = ma?.sizeOrder ?? 99;
+        const sb = mb?.sizeOrder ?? 99;
+        if (sa !== sb) return sa - sb;
+        return a.sku.localeCompare(b.sku);
+      });
+    } else {
+      // AWD or anything else → alphabetical (current behavior)
+      arr.sort((a, b) => a.sku.localeCompare(b.sku));
+    }
+    return arr;
+  }, [po.lineRows, po.skuMeta, destination]);
 
   const [alloc, setAlloc] = useState<Map<string, string>>(() => {
     const m = new Map<string, string>();
@@ -108,7 +145,10 @@ export function ShipmentEditor({
       for (const sk of skuRows) {
         const cur = Number(prev.get(sk.sku) ?? '');
         if (!Number.isFinite(cur) || cur === 0) {
-          next.set(sk.sku, String(sk.totalQty));
+          // Remaining to allocate = PO qty − already on other shipments.
+          // If 0, leave the field blank (nothing to add for this SKU).
+          const remaining = Math.max(sk.totalQty - (otherAllocated.get(sk.sku) ?? 0), 0);
+          if (remaining > 0) next.set(sk.sku, String(remaining));
         }
       }
       return next;
@@ -289,34 +329,44 @@ export function ShipmentEditor({
                   <tr className="bg-warm-beige/40 text-charcoal/70 text-[11px] uppercase tracking-wider">
                     <Th className="text-left">SKU</Th>
                     <Th className="text-right">PO qty</Th>
-                    <Th className="text-left">Plan dest</Th>
+                    <Th className="text-right">On other ship.</Th>
+                    <Th className="text-right">Remaining</Th>
                     <Th className="text-right w-32">Ship qty</Th>
                   </tr>
                 </thead>
                 <tbody>
                   {skuRows.length === 0 && (
-                    <tr><td colSpan={4} className="text-center text-charcoal/60 py-4 text-xs">No line items on this PO yet.</td></tr>
+                    <tr><td colSpan={5} className="text-center text-charcoal/60 py-4 text-xs">No line items on this PO yet.</td></tr>
                   )}
-                  {skuRows.map((sk, i) => (
-                    <tr key={sk.sku} className={`${i % 2 === 0 ? 'bg-warm-white' : 'bg-warm-beige/15'} border-b border-warm-gray/20`}>
-                      <Td className="font-mono text-xs">{sk.sku}</Td>
-                      <Td className="text-right tabular-nums">{sk.totalQty.toLocaleString()}</Td>
-                      <Td className="text-xs text-charcoal/60">{sk.dests.join(', ') || '—'}</Td>
-                      <Td className="text-right">
-                        <input
-                          type="number" min={0} step={1}
-                          placeholder="0"
-                          value={alloc.get(sk.sku) ?? ''}
-                          onChange={(e) => setAllocQty(sk.sku, e.target.value)}
-                          className="w-24 px-2 py-1 rounded border border-warm-gray/60 bg-warm-white text-sm tabular-nums text-right"
-                        />
-                      </Td>
-                    </tr>
-                  ))}
+                  {skuRows.map((sk, i) => {
+                    const onOther = otherAllocated.get(sk.sku) ?? 0;
+                    const remaining = Math.max(sk.totalQty - onOther, 0);
+                    return (
+                      <tr key={sk.sku} className={`${i % 2 === 0 ? 'bg-warm-white' : 'bg-warm-beige/15'} border-b border-warm-gray/20`}>
+                        <Td className="font-mono text-xs">{sk.sku}</Td>
+                        <Td className="text-right tabular-nums">{sk.totalQty.toLocaleString()}</Td>
+                        <Td className="text-right tabular-nums text-charcoal/60">
+                          {onOther > 0 ? onOther.toLocaleString() : <span className="text-charcoal/30">—</span>}
+                        </Td>
+                        <Td className={`text-right tabular-nums ${remaining === 0 ? 'text-charcoal/40' : 'text-charcoal/70'}`}>
+                          {remaining.toLocaleString()}
+                        </Td>
+                        <Td className="text-right">
+                          <input
+                            type="number" min={0} step={1}
+                            placeholder="0"
+                            value={alloc.get(sk.sku) ?? ''}
+                            onChange={(e) => setAllocQty(sk.sku, e.target.value)}
+                            className="w-24 px-2 py-1 rounded border border-warm-gray/60 bg-warm-white text-sm tabular-nums text-right"
+                          />
+                        </Td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
                 <tfoot>
                   <tr className="bg-warm-beige/30 text-charcoal/70 text-xs">
-                    <Td colSpan={3} className="text-right font-medium">Allocated</Td>
+                    <Td colSpan={4} className="text-right font-medium">Allocated</Td>
                     <Td className="text-right tabular-nums font-medium">{allocTotal.toLocaleString()} units</Td>
                   </tr>
                 </tfoot>

@@ -22,8 +22,8 @@ const robotoMono = Roboto_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'HIKERS Inventory',
-  description: 'HIKERS Co. — multi-location inventory tracking and forecasting',
+  title: 'HIKERS Dashboard',
+  description: 'HIKERS Co. — inventory, sales, and operations dashboard',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

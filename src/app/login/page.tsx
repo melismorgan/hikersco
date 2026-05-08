@@ -11,13 +11,13 @@ function LoginInner() {
   return (
     <main className="min-h-screen flex items-center justify-center px-6">
       <div className="max-w-md w-full text-center">
-        <h1 className="text-4xl mb-2">HIKERS Inventory</h1>
+        <h1 className="text-4xl mb-2">HIKERS Dashboard</h1>
         <p className="text-charcoal/70 mb-10">
           Sign in with the Google account on the allow-list.
         </p>
 
         <button
-          onClick={() => signIn('google', { callbackUrl: '/dashboard' })}
+          onClick={() => signIn('google', { callbackUrl: '/marketing' })}
           className="inline-flex items-center gap-3 rounded-md bg-indigo px-6 py-3 text-warm-white hover:bg-indigo/90 transition-colors"
         >
           Sign in with Google

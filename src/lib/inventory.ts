@@ -1472,12 +1472,16 @@ export interface LandedCostContribution {
   qty: number;
   unitCost: number;
   lineValue: number;        // qty * unitCost
-  poGoodsValue: number;     // total goods value of all Received lines in this PO
+  poGoodsValue: number;     // total goods value of all non-Cancelled lines in this PO
   valueShare: number;       // lineValue / poGoodsValue, 0..1
   poShipping: number;       // sum of Type=Shipping principal for this PO
   poFees: number;           // sum of Fee across all transaction types for this PO
   freightAlloc: number;     // valueShare * poShipping
   feesAlloc: number;        // valueShare * poFees
+  /** Destination of this line ('ShipBob WI', 'AWD Storage', etc.) — drives 3PL inbound allocation. */
+  dest: string;
+  /** 3PL inbound fee allocated to this line: qty × dest-specific rate ($0 for AWD, blended rate for ShipBob). */
+  threePLAlloc: number;
 }
 
 /** Per-SKU landed cost row. */
@@ -1498,21 +1502,275 @@ export interface LandedCostRow {
   freightPerUnit: number;
   feesTotal: number;
   feesPerUnit: number;
-  dutyPerUnit: number;       // 0 placeholder
-  threePLPerUnit: number;    // 0 placeholder
-  totalLandedCost: number;   // exwUnitCost + freightPerUnit + feesPerUnit + ...
+  dutyPerUnit: number;       // 0 — DDP wraps duty into freight
+  threePLTotal: number;      // sum of 3PL inbound across contributions ($0 for AWD-destined units)
+  threePLPerUnit: number;    // threePLTotal / unitsReceived
+  totalLandedCost: number;   // exwUnitCost + freightPerUnit + feesPerUnit + threePLPerUnit
   poCount: number;
   lastReceived: string;
   contributions: LandedCostContribution[];
 }
 
+/** ShipBob Bills row — read from the ShipBob Bills tab in the inventory tracker. */
+export interface ShipBobBillRow {
+  invoiceId: string | number;
+  date: string;
+  category: string;          // 'Inbound' | 'Storage' | 'Outbound' | 'Additional' | 'Return' | 'Credit' | 'Payment' | 'Other'
+  detail: string;
+  amount: number;
+  notes: string;
+}
+
+/** Read the ShipBob Bills tab. Returns [] if the tab doesn't exist (graceful). */
+export async function readShipBobBills(): Promise<ShipBobBillRow[]> {
+  let grid: string[][];
+  try {
+    grid = await readTab('ShipBob Bills');
+  } catch {
+    return [];
+  }
+  if (!grid || grid.length < 2) return [];
+  const out: ShipBobBillRow[] = [];
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    if (!r || !r[0]) continue;
+    out.push({
+      invoiceId: r[0],
+      date: str(r[1]),
+      category: str(r[2]),
+      detail: str(r[3]),
+      amount: num(r[4]),
+      notes: str(r[5]),
+    });
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Amazon Bills tab — populated by 28_amazon_finances_sync.gs (SP-API
+// /financialEvents). Schema written in the Apps Script. Costs Dashboard
+// reads this alongside ShipBob Bills.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface AmazonBillRow {
+  postedDate: string;          // 'YYYY-MM-DD'
+  periodMonth: string;         // 'YYYY-MM'
+  eventType: string;           // ShipmentEvent | RefundEvent | ServiceFeeEvent | AdjustmentEvent
+  category: string;            // Outbound | Storage | Inbound | Additional | Sales Fees | Reserve | Other | Marketing
+  feeType: string;             // raw FeeType, e.g. 'FBAPerUnitFulfillmentFee', 'Commission', etc.
+  amount: number;              // signed; positive = cost we paid, negative = refund of cost
+  sku: string;                 // canonical SKU (channel-suffix stripped)
+  skuChannel: string;          // raw Amazon SellerSKU with -FBA suffix
+  orderId: string;
+  qty: number;
+  notes: string;
+}
+
+/** Read the Amazon Bills tab. Returns [] if the tab doesn't exist (graceful). */
+export async function readAmazonBills(): Promise<AmazonBillRow[]> {
+  let grid: string[][];
+  try {
+    grid = await readTab('Amazon Bills');
+  } catch {
+    return [];
+  }
+  if (!grid || grid.length < 2) return [];
+  const out: AmazonBillRow[] = [];
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    if (!r || !r[0]) continue;
+    out.push({
+      postedDate:  str(r[0]),
+      periodMonth: str(r[1]),
+      eventType:   str(r[2]),
+      category:    str(r[3]),
+      feeType:     str(r[4]),
+      amount:      num(r[5]),
+      sku:         str(r[6]),
+      skuChannel:  str(r[7]),
+      orderId:     str(r[8]),
+      qty:         num(r[9]),
+      notes:       str(r[10]),
+    });
+  }
+  return out;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Costs Dashboard — joins ShipBob Bills + Amazon Bills into a single
+// warehouse × category × month matrix plus headline KPIs.
+// Mirrors the Apps Script `computeCostsDashboard()` in 31_costs_dashboard.gs
+// so the Sheet and the web view always agree.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface CostMatrixRow {
+  warehouse: string;            // 'ShipBob WI' | 'Amazon FBA' | 'AWD'
+  category: string;             // Inbound | Storage | Outbound | Additional | Sales Fees | Return | Credit
+  monthValues: number[];        // one entry per month in `months`
+  total: number;
+}
+
+export interface CostsDashboardData {
+  kpis: {
+    shipBobStorage: number;
+    shipBobOutbound: number;
+    shipBobInbound: number;
+    amazonOutbound: number;
+    amazonSalesFees: number;
+  };
+  months: string[];             // trailing 12, 'YYYY-MM' oldest→newest
+  matrixRows: CostMatrixRow[];
+  monthTotals: number[];        // grand total per month
+  grandTotal: number;
+}
+
+/**
+ * Compute the Costs Dashboard from raw ShipBob Bills + Amazon Bills.
+ *
+ * Aggregation rules match the Apps Script implementation:
+ * - ShipBob: skip Category='Payment' (settlement, not cost). Everything else
+ *   uses the signed Amount as-is.
+ * - Amazon: skip Category in {Reserve, Marketing, Other} (not logistics cost
+ *   or future Marketing module). Sign convention: Amount is already positive=cost.
+ * - Warehouse derivation:
+ *     ShipBob → 'ShipBob WI'
+ *     Amazon FeeType starting with 'AWD' or 'AmazonUpstream' → 'AWD'
+ *     Amazon everything else → 'Amazon FBA'
+ * - Window: trailing 12 calendar months ending current month.
+ * - Empty (warehouse, category) combos with $0 across the full window are
+ *   suppressed from the output.
+ */
+export async function loadCostsDashboard(): Promise<CostsDashboardData> {
+  const [shipBobBills, amazonBills] = await Promise.all([
+    readShipBobBills(),
+    readAmazonBills(),
+  ]);
+
+  const months = trailing12Months();
+  const monthIdx = new Map(months.map((m, i) => [m, i] as const));
+
+  // matrix[warehouse][category][monthIdx] = amount
+  const matrix = new Map<string, Map<string, number[]>>();
+  function bump(wh: string, cat: string, mi: number, amt: number) {
+    if (!matrix.has(wh)) matrix.set(wh, new Map());
+    const cm = matrix.get(wh)!;
+    if (!cm.has(cat)) cm.set(cat, new Array(months.length).fill(0));
+    cm.get(cat)![mi] += amt;
+  }
+
+  // ShipBob
+  for (const r of shipBobBills) {
+    if (r.category === 'Payment') continue;
+    if (!Number.isFinite(r.amount) || r.amount === 0) continue;
+    const m = (r.date || '').slice(0, 7);
+    const mi = monthIdx.get(m);
+    if (mi == null) continue;
+    bump('ShipBob WI', r.category, mi, r.amount);
+  }
+
+  // Amazon
+  for (const r of amazonBills) {
+    if (r.category === 'Reserve' || r.category === 'Marketing' || r.category === 'Other') continue;
+    if (!Number.isFinite(r.amount) || r.amount === 0) continue;
+    const m = r.periodMonth || (r.postedDate || '').slice(0, 7);
+    const mi = monthIdx.get(m);
+    if (mi == null) continue;
+    const wh = /^AWD/.test(r.feeType) || /^AmazonUpstream/.test(r.feeType) ? 'AWD' : 'Amazon FBA';
+    bump(wh, r.category, mi, r.amount);
+  }
+
+  // Flatten with stable ordering
+  const WAREHOUSE_ORDER = ['ShipBob WI', 'Amazon FBA', 'AWD'];
+  const CATEGORY_ORDER  = ['Inbound', 'Storage', 'Outbound', 'Additional', 'Sales Fees', 'Return', 'Credit'];
+
+  const matrixRows: CostMatrixRow[] = [];
+  for (const wh of WAREHOUSE_ORDER) {
+    if (!matrix.has(wh)) continue;
+    const cm = matrix.get(wh)!;
+    const cats = Array.from(cm.keys()).sort((a, b) => {
+      const ai = CATEGORY_ORDER.indexOf(a);
+      const bi = CATEGORY_ORDER.indexOf(b);
+      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+    for (const cat of cats) {
+      const vals = cm.get(cat)!;
+      const total = vals.reduce((s, v) => s + v, 0);
+      if (Math.abs(total) < 0.005) continue;
+      matrixRows.push({ warehouse: wh, category: cat, monthValues: vals, total });
+    }
+  }
+  // Append any unexpected warehouses (defensive)
+  for (const wh of matrix.keys()) {
+    if (WAREHOUSE_ORDER.includes(wh)) continue;
+    const cm = matrix.get(wh)!;
+    for (const [cat, vals] of cm) {
+      const total = vals.reduce((s, v) => s + v, 0);
+      if (Math.abs(total) < 0.005) continue;
+      matrixRows.push({ warehouse: wh, category: cat, monthValues: vals, total });
+    }
+  }
+
+  const monthTotals = months.map((_, i) => matrixRows.reduce((s, r) => s + r.monthValues[i], 0));
+  const grandTotal = monthTotals.reduce((s, v) => s + v, 0);
+
+  function sumCat(wh: string, cat: string): number {
+    const row = matrixRows.find((r) => r.warehouse === wh && r.category === cat);
+    return row ? row.total : 0;
+  }
+
+  const kpis = {
+    shipBobStorage:   sumCat('ShipBob WI', 'Storage'),
+    shipBobOutbound:  sumCat('ShipBob WI', 'Outbound'),
+    shipBobInbound:   sumCat('ShipBob WI', 'Inbound'),
+    amazonOutbound:   sumCat('Amazon FBA', 'Outbound'),
+    amazonSalesFees:  sumCat('Amazon FBA', 'Sales Fees') + sumCat('AWD', 'Sales Fees'),
+  };
+
+  return { kpis, months, matrixRows, monthTotals, grandTotal };
+}
+
+function trailing12Months(): string[] {
+  const out: string[] = [];
+  const now = new Date();
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    out.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'));
+  }
+  return out;
+}
+
+
+/**
+ * Compute the blended ShipBob inbound rate per unit:
+ *   total Inbound fees (across all imported bills) ÷ total units received at
+ *   ShipBob WI (across all Received POs).
+ *
+ * If either side is empty, returns 0 (3PL inbound stays at $0 in landed cost).
+ */
+function computeShipBobInboundRate(bills: ShipBobBillRow[], poRows: PoRow[]): number {
+  let inbound = 0;
+  for (const b of bills) if (b.category === 'Inbound') inbound += b.amount;
+
+  let units = 0;
+  for (const r of poRows) {
+    if (r.status !== 'Received') continue;
+    if (r.dest !== 'ShipBob WI') continue;
+    if ((r.type || '').toLowerCase() === 'internal transfer') continue;
+    units += r.qty;
+  }
+  return units > 0 ? inbound / units : 0;
+}
+
 export async function loadLandedCost(): Promise<LandedCostRow[]> {
-  const [poRows, txnsByPo, skuMaster] = await Promise.all([
+  const [poRows, txnsByPo, skuMaster, shipBobBills] = await Promise.all([
     readPos(),
     readPoPaymentTransactions(),
     readSkuMaster(),
+    readShipBobBills(),
   ]);
   const skuMetaBySku = new Map(skuMaster.map((m) => [m.sku, m]));
+  const shipBobInboundRate = computeShipBobInboundRate(shipBobBills, poRows);
 
   // Two groupings:
   //   • allLinesByPo  = ALL non-Cancelled lines (used as the allocation denominator,
@@ -1553,6 +1811,7 @@ export async function loadLandedCost(): Promise<LandedCostRow[]> {
     exwValue: number;
     freightAlloc: number;
     feesAlloc: number;
+    threePLAlloc: number;
     poSet: Set<string>;
     lastReceived: string;
     contributions: LandedCostContribution[];
@@ -1574,11 +1833,15 @@ export async function loadLandedCost(): Promise<LandedCostRow[]> {
       const valueShare = lineValue / poGoodsValue;
       const freightAlloc = valueShare * poShipping;
       const feesAlloc = valueShare * poFees;
+      // 3PL inbound allocation: ShipBob WI uses the blended ShipBob inbound
+      // rate; AWD-destined units are $0 (per Fall 2025 AWD migration); other
+      // destinations also $0 by default until those data sources are wired up.
+      const threePLAlloc = l.dest === 'ShipBob WI' ? l.qty * shipBobInboundRate : 0;
 
       let agg = skuAgg.get(l.sku);
       if (!agg) {
         agg = {
-          units: 0, exwValue: 0, freightAlloc: 0, feesAlloc: 0,
+          units: 0, exwValue: 0, freightAlloc: 0, feesAlloc: 0, threePLAlloc: 0,
           poSet: new Set(), lastReceived: '', contributions: [],
         };
         skuAgg.set(l.sku, agg);
@@ -1587,6 +1850,7 @@ export async function loadLandedCost(): Promise<LandedCostRow[]> {
       agg.exwValue += lineValue;
       agg.freightAlloc += freightAlloc;
       agg.feesAlloc += feesAlloc;
+      agg.threePLAlloc += threePLAlloc;
       agg.poSet.add(poNumber);
       if (l.receivedDate && l.receivedDate > agg.lastReceived) {
         agg.lastReceived = l.receivedDate;
@@ -1603,6 +1867,8 @@ export async function loadLandedCost(): Promise<LandedCostRow[]> {
         poFees,
         freightAlloc,
         feesAlloc,
+        dest: l.dest || '',
+        threePLAlloc,
       });
     }
   }
@@ -1613,8 +1879,8 @@ export async function loadLandedCost(): Promise<LandedCostRow[]> {
     const exwUnitCost = agg.exwValue / agg.units;
     const freightPerUnit = agg.freightAlloc / agg.units;
     const feesPerUnit = agg.feesAlloc / agg.units;
-    const dutyPerUnit = 0;
-    const threePLPerUnit = 0;
+    const dutyPerUnit = 0;  // DDP — duty is wrapped into freight already
+    const threePLPerUnit = agg.threePLAlloc / agg.units;
     const totalLandedCost = exwUnitCost + freightPerUnit + feesPerUnit + dutyPerUnit + threePLPerUnit;
     // Sort contributions by date desc so the latest PO shows first when expanded
     agg.contributions.sort((a, b) => (b.receivedDate || '').localeCompare(a.receivedDate || ''));
@@ -1635,6 +1901,7 @@ export async function loadLandedCost(): Promise<LandedCostRow[]> {
       feesTotal: agg.feesAlloc,
       feesPerUnit,
       dutyPerUnit,
+      threePLTotal: agg.threePLAlloc,
       threePLPerUnit,
       totalLandedCost,
       poCount: agg.poSet.size,
