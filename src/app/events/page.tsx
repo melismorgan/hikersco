@@ -3,6 +3,7 @@ import { authOptions } from '@/lib/auth';
 import { Header } from '@/components/Header';
 import { EventsView } from '@/components/EventsView';
 import { readEvents } from '@/lib/events';
+import { loadSaleCandidates, readStyleLines, type SaleCandidate } from '@/lib/inventory';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -12,12 +13,24 @@ export default async function EventsPage() {
   const email = session?.user?.email ?? null;
 
   let events: Awaited<ReturnType<typeof readEvents>> = [];
+  let saleCandidates: SaleCandidate[] = [];
+  let styleLines: Map<string, string> = new Map();
   let loadError: string | null = null;
   try {
-    events = await readEvents();
+    [events, saleCandidates, styleLines] = await Promise.all([
+      readEvents(),
+      // Sale candidates is a soft side-feature; if the Costs by SKU tab
+      // hasn't been computed yet we just show no recommendations.
+      loadSaleCandidates().catch(() => [] as SaleCandidate[]),
+      // Line lookups for banner grouping; missing Style_Templates → no banners
+      readStyleLines().catch(() => new Map<string, string>()),
+    ]);
   } catch (err) {
     loadError = err instanceof Error ? err.message : String(err);
   }
+  // Plain object so we can pass through to a 'use client' child without
+  // tripping serialization warnings on Map.
+  const styleLineMap: Record<string, string> = Object.fromEntries(styleLines);
 
   return (
     <>
@@ -39,7 +52,7 @@ export default async function EventsPage() {
             <pre className="text-xs whitespace-pre-wrap">{loadError}</pre>
           </div>
         ) : (
-          <EventsView events={events} />
+          <EventsView events={events} saleCandidates={saleCandidates} styleLineMap={styleLineMap} />
         )}
       </main>
     </>

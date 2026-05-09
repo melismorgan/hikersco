@@ -1623,6 +1623,34 @@ export interface CostsDashboardData {
   matrixRows: CostMatrixRow[];
   monthTotals: number[];        // grand total per month
   grandTotal: number;
+  topCarryingSkus: SkuCarryingCostRow[];   // Phase 2 — top 30 by Total $/mo
+}
+
+export interface SkuCarryingCostRow {
+  sku: string;
+  style: string;
+  color: string;
+  size: string;
+  shipbobUnits: number;
+  fbaUnits: number;
+  awdUnits: number;
+  totalUnits: number;
+  shipbobMonthly: number;
+  fbaMonthly: number;
+  awdMonthly: number;
+  totalMonthly: number;
+  avgPerDay: number;          // 0 if no velocity data
+  monthsOfCover: number | null;  // null when avgPerDay is 0
+}
+
+export interface SaleCandidate {
+  style: string;
+  color: string;
+  totalUnits: number;
+  totalMonthly: number;             // group total carrying cost
+  weightedMonthsOfCover: number | null;  // group total units / (group total daily demand × 30); null when total demand is 0
+  stuckSkuCount: number;            // sizes within this parent that meet the per-SKU stuck threshold
+  totalSkuCount: number;            // total sizes with on-hand
 }
 
 /**
@@ -1642,9 +1670,10 @@ export interface CostsDashboardData {
  *   suppressed from the output.
  */
 export async function loadCostsDashboard(): Promise<CostsDashboardData> {
-  const [shipBobBills, amazonBills] = await Promise.all([
+  const [shipBobBills, amazonBills, carryingSkus] = await Promise.all([
     readShipBobBills(),
     readAmazonBills(),
+    readCostsBySku(),
   ]);
 
   const months = trailing12Months();
@@ -1727,7 +1756,137 @@ export async function loadCostsDashboard(): Promise<CostsDashboardData> {
     amazonSalesFees:  sumCat('Amazon FBA', 'Sales Fees') + sumCat('AWD', 'Sales Fees'),
   };
 
-  return { kpis, months, matrixRows, monthTotals, grandTotal };
+  // Top 30 by Total $/mo — defensive re-sort in case the tab gets edited
+  const topCarryingSkus = carryingSkus
+    .slice()
+    .sort((a, b) => b.totalMonthly - a.totalMonthly)
+    .slice(0, 30);
+
+  return { kpis, months, matrixRows, monthTotals, grandTotal, topCarryingSkus };
+}
+
+/**
+ * Reads the precomputed `Costs by SKU` tab written by
+ * 31_costs_dashboard.gs.computeSkuCarryingCost(). Returns rows in tab order
+ * (already sorted by Total $/mo desc, but loadCostsDashboard re-sorts
+ * defensively before slicing).
+ *
+ * Schema (15 cols): A SKU · B Style · C Color · D Size · E ShipBob WI Units ·
+ * F Amazon FBA Units · G AWD Units · H Total Units · I ShipBob $/mo ·
+ * J Amazon FBA $/mo · K AWD $/mo · L Total $/mo · M Avg/Day 30d ·
+ * N Months of Cover · O Last Computed.
+ */
+export async function readCostsBySku(): Promise<SkuCarryingCostRow[]> {
+  let grid: string[][];
+  try {
+    grid = await readTab('Costs by SKU');
+  } catch {
+    return [];
+  }
+  if (!grid || grid.length < 2) return [];
+  const out: SkuCarryingCostRow[] = [];
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    if (!r || !r[0]) continue;
+    const monthsOfCoverRaw = r[13];
+    const monthsOfCover =
+      monthsOfCoverRaw === '' || monthsOfCoverRaw == null ? null : num(monthsOfCoverRaw);
+    out.push({
+      sku: str(r[0]),
+      style: str(r[1]),
+      color: str(r[2]),
+      size: str(r[3]),
+      shipbobUnits: num(r[4]),
+      fbaUnits: num(r[5]),
+      awdUnits: num(r[6]),
+      totalUnits: num(r[7]),
+      shipbobMonthly: num(r[8]),
+      fbaMonthly: num(r[9]),
+      awdMonthly: num(r[10]),
+      totalMonthly: num(r[11]),
+      avgPerDay: num(r[12]),
+      monthsOfCover: Number.isFinite(monthsOfCover as number) ? (monthsOfCover as number) : null,
+    });
+  }
+  return out;
+}
+
+/**
+ * Sale Candidates — Style+Color groups stuck in inventory long enough to
+ * be worth running a sale on. Built by rolling up the per-SKU carrying-
+ * cost data to the parent (Style+Color) level. We never recommend putting
+ * a single size on sale — sales happen at the visible product level.
+ *
+ * Group rules:
+ *   - totalUnits + totalMonthly: simple sums across the parent's sizes
+ *   - weightedMonthsOfCover: groupTotalUnits / (sum of per-size daily demand × 30)
+ *     i.e., "how many months will the whole color last at current sales pace"
+ *   - stuckSkuCount: sizes within this parent that individually meet the
+ *     per-SKU stuck threshold (≥6 mo cover, ≥$5/mo). A high count is a
+ *     stronger signal than a single straggler size.
+ *
+ * Filter: parent-level months of cover ≥ minMoC AND group total cost ≥ minCost.
+ * The group threshold defaults to $20/mo because a color is typically 4-7 sizes
+ * — a $5/SKU floor would catch nearly every parent; $20/group filters to ones
+ * actually worth a promo.
+ */
+export async function loadSaleCandidates(opts?: {
+  minMonthsOfCover?: number;
+  minMonthlyCost?: number;
+  limit?: number;
+}): Promise<SaleCandidate[]> {
+  const minMoC  = opts?.minMonthsOfCover ?? 6;
+  const minCost = opts?.minMonthlyCost   ?? 20;
+  const limit   = opts?.limit            ?? 10;
+
+  const rows = await readCostsBySku();
+  if (!rows.length) return [];
+
+  type Acc = {
+    style: string; color: string;
+    totalUnits: number; totalMonthly: number; totalDailyDemand: number;
+    stuckSkuCount: number; totalSkuCount: number;
+  };
+  const groups = new Map<string, Acc>();
+
+  for (const r of rows) {
+    if (!r.style && !r.color) continue;
+    const key = `${r.style}|${r.color}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { style: r.style, color: r.color, totalUnits: 0, totalMonthly: 0, totalDailyDemand: 0, stuckSkuCount: 0, totalSkuCount: 0 };
+      groups.set(key, g);
+    }
+    g.totalUnits       += r.totalUnits;
+    g.totalMonthly     += r.totalMonthly;
+    g.totalDailyDemand += r.avgPerDay;   // per-size daily demand sums to group demand
+    g.totalSkuCount    += 1;
+    if (r.monthsOfCover !== null && r.monthsOfCover >= 6 && r.totalMonthly >= 5) {
+      g.stuckSkuCount += 1;
+    }
+  }
+
+  const candidates: SaleCandidate[] = Array.from(groups.values())
+    .map((g) => ({
+      style: g.style,
+      color: g.color,
+      totalUnits: g.totalUnits,
+      totalMonthly: Math.round(g.totalMonthly * 100) / 100,
+      weightedMonthsOfCover: g.totalDailyDemand > 0
+        ? g.totalUnits / (g.totalDailyDemand * 30)
+        : null,
+      stuckSkuCount: g.stuckSkuCount,
+      totalSkuCount: g.totalSkuCount,
+    }))
+    .filter((c) =>
+      c.weightedMonthsOfCover !== null &&
+      c.weightedMonthsOfCover >= minMoC &&
+      c.totalMonthly >= minCost
+    )
+    .sort((a, b) => b.totalMonthly - a.totalMonthly)
+    .slice(0, limit);
+
+  return candidates;
 }
 
 function trailing12Months(): string[] {

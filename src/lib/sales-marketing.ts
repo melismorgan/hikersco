@@ -47,6 +47,28 @@ export interface CampaignRow {
   revenue: number;
 }
 
+export interface DiscountRow {
+  date: string;
+  channel: string;       // 'Shopify' | 'Amazon'
+  code: string;          // discount code (Shopify) or PromotionId (Amazon)
+  codeType: string;      // 'Code' | 'Auto' | 'Manual' | 'Script' (Shopify); 'Principal' | 'Shipping' | 'Promotion' (Amazon)
+  sku: string;
+  orderId: string;
+  discountAmount: number;
+  lineSubtotal: number;  // Shopify only; blank/0 for Amazon in v1
+}
+
+export interface DiscountCodeTotals {
+  code: string;
+  channel: string;
+  codeType: string;
+  orders: number;            // distinct order count
+  lines: number;             // total discount-line count
+  grossRevenue: number;      // sum of line subtotals (Shopify only — Amazon contributes 0)
+  discountAmount: number;
+  discountPct: number | null;  // discountAmount / grossRevenue; null when grossRevenue is 0 (e.g. Amazon-only codes)
+}
+
 export interface ChannelTotals {
   channel: string;
   orders: number;
@@ -84,35 +106,42 @@ export interface SalesMarketingData {
     advertisingRevenue: number;           // paid-ad attribution only (Meta + Google + Amazon Ads)
     emailSmsRevenue: number;              // Klaviyo + Postscript-* attribution
     blendedRoas: number | null;
+    discountAmount: number;               // total $ discounted in window (Shopify + Amazon)
+    discountPctOfGross: number | null;    // discountAmount / grossRevenue; null if no gross
   };
   channelMix: ChannelTotals[];
   platformBreakdown: PlatformTotals[];
   dailyTrend: DailyTrendPoint[];
   topCampaigns: CampaignRow[];
   topFlows: CampaignRow[];
+  topDiscountCodes: DiscountCodeTotals[];
   rawSalesRowCount: number;
   rawMarketingRowCount: number;
   rawCampaignRowCount: number;
+  rawDiscountRowCount: number;
 }
 
 const SALES_DAILY_TAB = 'Sales Daily';
 const MARKETING_DAILY_TAB = 'Marketing Daily';
 const CAMPAIGNS_TAB = 'Campaigns';
+const DISCOUNTS_TAB = 'Discounts';
 
 /**
  * Load and shape the Sales + Marketing dashboard data.
  * @param windowDays inclusive lookback window in days. Default 30.
  */
 export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketingData> {
-  const [salesGrid, marketingGrid, campaignsGrid] = await Promise.all([
+  const [salesGrid, marketingGrid, campaignsGrid, discountsGrid] = await Promise.all([
     readTab(SALES_DAILY_TAB).catch(() => [] as string[][]),
     readTab(MARKETING_DAILY_TAB).catch(() => [] as string[][]),
     readTab(CAMPAIGNS_TAB).catch(() => [] as string[][]),
+    readTab(DISCOUNTS_TAB).catch(() => [] as string[][]),
   ]);
 
   const sales = parseSalesDaily(salesGrid);
   const marketing = parseMarketingDaily(marketingGrid);
   const campaigns = parseCampaigns(campaignsGrid);
+  const discounts = parseDiscounts(discountsGrid);
 
   // Window ENDS yesterday by default — today's data is intentionally
   // excluded because the daily sync runs at 05:00 PT and only captures
@@ -127,6 +156,7 @@ export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketin
   const campaignsInWindow = campaigns.filter(
     (r) => r.sendDate >= windowStart && r.sendDate <= windowEnd,
   );
+  const discountsInWindow = discounts.filter((r) => r.date >= windowStart && r.date <= windowEnd);
 
   // ---- Totals ----
   const netRevenue = sum(salesInWindow, (r) => r.netRevenue);
@@ -214,13 +244,86 @@ export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketin
   const dailyTrend = Array.from(trendMap.values()).sort((a, b) => a.date.localeCompare(b.date));
 
   // ---- Top campaigns / flows ----
+  // Campaigns each have a real send date so one row per campaign — no need
+  // to aggregate. Flows are stored as one row per (flow × day) (see the
+  // distribute step in 33_klaviyo_sync.gs), so we sum daily rows back up
+  // to per-flow before picking the top 10. Without the rollup, Top Flows
+  // would show 10 individual days of the same flow.
   const topCampaigns = campaignsInWindow
     .filter((c) => c.type === 'Campaign')
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
-  const topFlows = campaignsInWindow
+
+  const flowAggMap = new Map<string, CampaignRow>();
+  campaignsInWindow
     .filter((c) => c.type === 'Flow')
+    .forEach((c) => {
+      const key = `${c.platform}|${c.name}`;
+      const existing = flowAggMap.get(key);
+      if (existing) {
+        existing.recipients += c.recipients;
+        existing.opens += c.opens;
+        existing.clicks += c.clicks;
+        existing.conversions += c.conversions;
+        existing.revenue += c.revenue;
+      } else {
+        // Clone so we don't mutate the source row
+        flowAggMap.set(key, { ...c });
+      }
+    });
+  const topFlows = Array.from(flowAggMap.values())
+    .map((f) => ({ ...f, revenue: round2(f.revenue) }))
     .sort((a, b) => b.revenue - a.revenue)
+    .slice(0, 10);
+
+  // ---- Discounts: total + top codes ----
+  // Aggregate by (channel, code). Distinct order count via a per-key Set.
+  // Note Amazon line subtotals are blank in v1, so Amazon-only codes have
+  // grossRevenue=0 and discountPct=null — the dashboard renders that as "—".
+  const discountAmount = sum(discountsInWindow, (r) => r.discountAmount);
+  const discountPctOfGross = grossRevenue > 0 ? discountAmount / grossRevenue : null;
+
+  type DiscountAgg = DiscountCodeTotals & { _orderIds: Set<string> };
+  const discountMap = new Map<string, DiscountAgg>();
+  discountsInWindow.forEach((d) => {
+    const key = `${d.channel}|${d.code}`;
+    let agg = discountMap.get(key);
+    if (!agg) {
+      agg = {
+        code: d.code,
+        channel: d.channel,
+        codeType: d.codeType,
+        orders: 0,
+        lines: 0,
+        grossRevenue: 0,
+        discountAmount: 0,
+        discountPct: null,
+        _orderIds: new Set<string>(),
+      };
+      discountMap.set(key, agg);
+    }
+    agg.lines += 1;
+    agg.grossRevenue += d.lineSubtotal;
+    agg.discountAmount += d.discountAmount;
+    if (d.orderId) agg._orderIds.add(d.orderId);
+  });
+  const topDiscountCodes: DiscountCodeTotals[] = Array.from(discountMap.values())
+    .map((agg) => {
+      const orders = agg._orderIds.size;
+      const gross = round2(agg.grossRevenue);
+      const disc = round2(agg.discountAmount);
+      return {
+        code: agg.code,
+        channel: agg.channel,
+        codeType: agg.codeType,
+        orders,
+        lines: agg.lines,
+        grossRevenue: gross,
+        discountAmount: disc,
+        discountPct: gross > 0 ? disc / gross : null,
+      };
+    })
+    .sort((a, b) => b.discountAmount - a.discountAmount)
     .slice(0, 10);
 
   return {
@@ -237,15 +340,19 @@ export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketin
       advertisingRevenue: round2(advertisingRevenue),
       emailSmsRevenue: round2(emailSmsRevenue),
       blendedRoas: blendedRoas !== null ? round2(blendedRoas) : null,
+      discountAmount: round2(discountAmount),
+      discountPctOfGross: discountPctOfGross !== null ? round2(discountPctOfGross) : null,
     },
     channelMix,
     platformBreakdown,
     dailyTrend,
     topCampaigns,
     topFlows,
+    topDiscountCodes,
     rawSalesRowCount: sales.length,
     rawMarketingRowCount: marketing.length,
     rawCampaignRowCount: campaigns.length,
+    rawDiscountRowCount: discounts.length,
   };
 }
 
@@ -294,6 +401,22 @@ function parseCampaigns(grid: string[][]): CampaignRow[] {
   })).filter((r) => !!r.sendDate && !!r.platform);
 }
 
+function parseDiscounts(grid: string[][]): DiscountRow[] {
+  if (grid.length < 2) return [];
+  // Discounts tab cols: A Date · B Channel · C Code · D Code Type · E SKU
+  // F Order ID · G Discount Amount · H Line Subtotal · I Last Updated
+  return grid.slice(1).map((r) => ({
+    date: dateOnly(r[0]),
+    channel: String(r[1] ?? ''),
+    code: String(r[2] ?? ''),
+    codeType: String(r[3] ?? ''),
+    sku: String(r[4] ?? ''),
+    orderId: String(r[5] ?? ''),
+    discountAmount: num(r[6]),
+    lineSubtotal: num(r[7]),
+  })).filter((r) => !!r.date && !!r.channel && !!r.code);
+}
+
 /* ===== helpers ===== */
 
 function num(v: unknown): number {
@@ -331,7 +454,8 @@ function sum<T>(arr: T[], fn: (x: T) => number): number {
 }
 
 function isEmailSmsPlatform(platform: string): boolean {
-  return platform === 'Klaviyo' || platform.startsWith('Postscript');
+  // 'Klaviyo' = campaigns; 'Klaviyo-Flow' = automated flows (welcome, abandoned cart, etc.)
+  return platform.startsWith('Klaviyo') || platform.startsWith('Postscript');
 }
 
 function isPaidAdPlatform(platform: string): boolean {

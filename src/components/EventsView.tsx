@@ -25,10 +25,14 @@
 import { useMemo, useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import type { EventRow, EventStatus, EventType } from '@/lib/events';
+import type { SaleCandidate } from '@/lib/inventory';
+import { lineOrderIndex } from '@/lib/line-order';
 import { createEvent, updateEvent, deleteEvent } from '@/app/events/actions';
 
 interface Props {
   events: EventRow[];
+  saleCandidates?: SaleCandidate[];
+  styleLineMap?: Record<string, string>;
 }
 
 const TYPE_OPTIONS: EventType[] = ['Launch', 'Restock', 'Promo', 'Email Blast', 'External'];
@@ -36,7 +40,7 @@ const STATUS_OPTIONS: EventStatus[] = ['Planned', 'Active', 'Ended'];
 
 const CHANNEL_OPTIONS = ['Email', 'Ads', 'Organic', 'Banner', 'Influencer'];
 
-export function EventsView({ events }: Props) {
+export function EventsView({ events, saleCandidates = [], styleLineMap = {} }: Props) {
   const router = useRouter();
   const [editing, setEditing] = useState<EventRow | 'new' | null>(null);
   const [filter, setFilter] = useState<EventStatus | 'All'>('All');
@@ -148,6 +152,8 @@ export function EventsView({ events }: Props) {
           </table>
         </div>
       </div>
+
+      {saleCandidates.length > 0 && <SaleCandidatesSection candidates={saleCandidates} styleLineMap={styleLineMap} />}
 
       {editing && (
         <EventModal
@@ -495,4 +501,125 @@ function Th({ children, className = '', title }: { children: React.ReactNode; cl
 }
 function Td({ children, className = '' }: { children: React.ReactNode; className?: string }) {
   return <td className={`px-3 py-1.5 ${className}`}>{children}</td>;
+}
+
+/**
+ * SaleCandidatesSection
+ *
+ * Recommendation card surfacing Style+Color groups that are stuck in
+ * inventory long enough to be sale candidates. Built off the per-SKU
+ * carrying cost data, rolled up to parent (Style+Color) — never per-size,
+ * since sales never run on individual sizes.
+ *
+ * Banner grouping by Line matches the visual treatment from /apparel,
+ * /accessories, and /velocity — same indigo banner, font-display caps,
+ * sticky-left so the line label stays visible during horizontal scroll.
+ * Lines with no candidates are simply omitted (no empty banners) since
+ * the candidates list is already pre-filtered to stuck items only.
+ */
+function SaleCandidatesSection({
+  candidates,
+  styleLineMap,
+}: {
+  candidates: SaleCandidate[];
+  styleLineMap: Record<string, string>;
+}) {
+  // Group by Line. Falls back to Style itself when Style_Templates has no
+  // mapping (matches the apparel/accessories grids' fallback behavior).
+  const items = useMemo(() => {
+    const enriched = candidates.map((c) => ({
+      ...c,
+      line: styleLineMap[c.style] || c.style || '(Unknown)',
+    }));
+    // Stable secondary sort by totalMonthly desc was already applied
+    // upstream in loadSaleCandidates. Re-group by line preserving that order.
+    const byLine = new Map<string, typeof enriched>();
+    for (const c of enriched) {
+      if (!byLine.has(c.line)) byLine.set(c.line, []);
+      byLine.get(c.line)!.push(c);
+    }
+    // Render Lines in canonical HIKERS order (HIKERS first, then Upfitter,
+    // Deluxe, etc.) — same ordering used on /apparel, /accessories, /velocity.
+    // Within each Line, candidates are already sorted by totalMonthly desc
+    // upstream in loadSaleCandidates.
+    const lines = Array.from(byLine.keys()).sort((a, b) => {
+      const ai = lineOrderIndex(a);
+      const bi = lineOrderIndex(b);
+      if (ai !== bi) return ai - bi;
+      return a.localeCompare(b);
+    });
+    const out: Array<{ kind: 'banner'; line: string } | { kind: 'row'; row: typeof enriched[number] }> = [];
+    for (const line of lines) {
+      out.push({ kind: 'banner', line });
+      for (const r of byLine.get(line)!) out.push({ kind: 'row', row: r });
+    }
+    return out;
+  }, [candidates, styleLineMap]);
+
+  return (
+    <div className="rounded-lg border border-clay/40 bg-clay/5 p-4 space-y-3">
+      <div className="flex items-baseline justify-between flex-wrap gap-2">
+        <h2 className="font-display text-lg text-charcoal">Sale Candidates</h2>
+        <p className="text-xs text-charcoal/60">
+          Style+Color groups stuck in inventory · grouped by Line · ranked by monthly carrying cost · top {candidates.length}
+        </p>
+      </div>
+      <p className="text-xs text-charcoal/70">
+        These are colors costing the most to hold AND sitting on the shelf longest. Worth running a sale, deep
+        discount, or pausing the next reorder. Pulled from the same data that powers <code className="font-mono text-[11px]">/costs</code>; refreshed daily.
+      </p>
+      <div className="overflow-x-auto rounded border border-warm-gray/40 bg-warm-white">
+        <table className="w-full text-sm border-separate border-spacing-0">
+          <thead className="text-xs uppercase tracking-wide text-charcoal/70 bg-warm-tint/40">
+            <tr>
+              <th className="px-3 py-2 text-left">Style + Color</th>
+              <th className="px-3 py-2 text-right">Sizes</th>
+              <th className="px-3 py-2 text-right">Stuck Sizes</th>
+              <th className="px-3 py-2 text-right">Total Units</th>
+              <th className="px-3 py-2 text-right">$/mo</th>
+              <th className="px-3 py-2 text-right">Months of Cover</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item, i) =>
+              item.kind === 'banner' ? (
+                <tr key={`banner-${item.line}-${i}`}>
+                  <td
+                    colSpan={6}
+                    className="bg-indigo text-warm-white px-3 py-2 font-display text-sm tracking-wide uppercase"
+                  >
+                    {item.line}
+                  </td>
+                </tr>
+              ) : (
+                <tr key={`${item.row.style}|${item.row.color}`} className="border-t border-warm-gray/20">
+                  <td className="px-3 py-2">
+                    <div className="font-semibold">{item.row.style || '—'}</div>
+                    <div className="text-[11px] text-charcoal/60 mt-0.5">{item.row.color || '—'}</div>
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">{item.row.totalSkuCount}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    <span className={item.row.stuckSkuCount > 0 ? 'text-clay font-semibold' : 'text-charcoal/50'}>
+                      {item.row.stuckSkuCount}
+                    </span>
+                    <span className="text-charcoal/40 text-[11px]"> / {item.row.totalSkuCount}</span>
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">{item.row.totalUnits.toLocaleString()}</td>
+                  <td className="px-3 py-2 text-right tabular-nums font-semibold">
+                    {item.row.totalMonthly.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-clay font-semibold">
+                    {item.row.weightedMonthsOfCover === null ? '—' : item.row.weightedMonthsOfCover.toFixed(1)}
+                  </td>
+                </tr>
+              )
+            )}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-[11px] text-charcoal/50">
+        Threshold: ≥6 months of cover at the parent level AND ≥$20/month group carrying cost. Tunable in <code className="font-mono text-[10px]">loadSaleCandidates()</code>.
+      </p>
+    </div>
+  );
 }

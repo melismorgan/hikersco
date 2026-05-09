@@ -14,6 +14,7 @@ export function MarketingDashboard({ data }: Props) {
     dailyTrend,
     topCampaigns,
     topFlows,
+    topDiscountCodes,
     windowStart,
     windowEnd,
     windowDays,
@@ -43,16 +44,13 @@ export function MarketingDashboard({ data }: Props) {
             <span className="font-medium">Google Ads</span> and <span className="font-medium">Amazon Ads</span> — awaiting API approval. Spend and attributed revenue from these channels are not yet included.
           </li>
           <li>
-            <span className="font-medium">Klaviyo flows</span> (welcome series, abandoned cart, browse abandonment, etc.) — only Klaviyo <em>campaigns</em> are wired up so far. Flows often drive more email revenue than campaigns; expect Email + SMS Revenue to grow once flows land.
-          </li>
-          <li>
             <span className="font-medium">Amazon orders</span> — Shopify revenue is fully populated; Amazon FBA/FBM is intermittent due to SP-API report queue delays. Catches up overnight.
           </li>
         </ul>
       </div>
 
-      {/* KPI strip — 5 tiles */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+      {/* KPI strip — 6 tiles */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <Kpi
           label="Net Revenue"
           value={fmtMoney(totals.netRevenue)}
@@ -80,6 +78,15 @@ export function MarketingDashboard({ data }: Props) {
             totals.blendedRoas !== null
               ? `${fmtMoney(totals.marketingConversionValue)} attributed`
               : 'no spend in window'
+          }
+        />
+        <Kpi
+          label="Discount Activity"
+          value={fmtMoney(totals.discountAmount)}
+          subtext={
+            totals.discountPctOfGross !== null
+              ? `${(totals.discountPctOfGross * 100).toFixed(1)}% of gross revenue`
+              : 'no gross revenue in window'
           }
         />
       </div>
@@ -227,10 +234,52 @@ export function MarketingDashboard({ data }: Props) {
         </Card>
       </div>
 
+      {/* Top Discount Codes — Shopify codes + Amazon promotions */}
+      <Card
+        title="Top Discount Codes"
+        subtitle="Ranked by total $ discounted in this window. Shopify discount codes + Amazon promotions."
+      >
+        {topDiscountCodes.length === 0 ? (
+          <Empty subtitle="No discounts applied in this window." />
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-charcoal/60 border-b border-warm-gray/40">
+                <th className="py-2 font-normal">Code</th>
+                <th className="py-2 font-normal">Channel</th>
+                <th className="py-2 font-normal">Type</th>
+                <th className="py-2 font-normal text-right">Orders</th>
+                <th className="py-2 font-normal text-right">Gross Rev</th>
+                <th className="py-2 font-normal text-right">$ Off</th>
+                <th className="py-2 font-normal text-right w-28">Discount %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {topDiscountCodes.map((d, i) => (
+                <tr key={`${d.channel}-${d.code}-${i}`} className="border-b border-warm-gray/20 last:border-b-0">
+                  <td className="py-2 font-mono text-xs truncate max-w-xs" title={d.code}>{d.code || '(unnamed)'}</td>
+                  <td className="py-2">{d.channel}</td>
+                  <td className="py-2 text-charcoal/70">{d.codeType}</td>
+                  <td className="py-2 text-right tabular-nums">{d.orders.toLocaleString()}</td>
+                  <td className="py-2 text-right tabular-nums">
+                    {d.grossRevenue > 0 ? fmtMoney(d.grossRevenue) : <span className="text-charcoal/40">—</span>}
+                  </td>
+                  <td className="py-2 text-right tabular-nums">{fmtMoney(d.discountAmount)}</td>
+                  <td className="py-2 text-right">
+                    {d.discountPct !== null ? <DiscountBar value={d.discountPct} /> : <span className="text-charcoal/40">—</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+
       <div className="text-xs text-charcoal/40 pt-2">
         Sales Daily: {data.rawSalesRowCount.toLocaleString()} rows · Marketing Daily:{' '}
         {data.rawMarketingRowCount.toLocaleString()} rows · Campaigns:{' '}
-        {data.rawCampaignRowCount.toLocaleString()} rows
+        {data.rawCampaignRowCount.toLocaleString()} rows · Discounts:{' '}
+        {data.rawDiscountRowCount.toLocaleString()} rows
       </div>
     </div>
   );
@@ -272,6 +321,23 @@ function ShareBar({ value }: { value: number }) {
         <div className="h-full bg-indigo" style={{ width: `${pct}%` }} />
       </div>
       <span className="tabular-nums text-charcoal/70 w-10 text-right">{pct.toFixed(0)}%</span>
+    </div>
+  );
+}
+
+/**
+ * DiscountBar — like ShareBar but in clay (red-orange) to signal margin
+ * pressure rather than channel mix. Shows 1 decimal because discount %
+ * is often in the single digits and a bare integer hides the variation.
+ */
+function DiscountBar({ value }: { value: number }) {
+  const pct = Math.max(0, Math.min(100, value * 100));
+  return (
+    <div className="flex items-center gap-2 justify-end">
+      <div className="w-16 h-2 bg-warm-gray/40 rounded-full overflow-hidden">
+        <div className="h-full bg-clay" style={{ width: `${pct}%` }} />
+      </div>
+      <span className="tabular-nums text-charcoal/70 w-12 text-right">{pct.toFixed(1)}%</span>
     </div>
   );
 }
