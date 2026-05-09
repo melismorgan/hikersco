@@ -147,9 +147,16 @@ export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketin
   // excluded because the daily sync runs at 05:00 PT and only captures
   // orders before then, so "today" looks like an artificial revenue
   // cliff if included. windowDays counts back from yesterday inclusively.
-  const today = new Date();
-  const windowEnd = isoDaysAgo(today, 1);             // yesterday
-  const windowStart = isoDaysAgo(today, windowDays);  // windowDays days ago
+  //
+  // CRITICAL: "yesterday" means yesterday in PACIFIC TIME, regardless of
+  // where the server runs. Sales Daily rows are written by Apps Script
+  // (PT-scheduled triggers) using PT-anchored dates. If we use the server's
+  // local clock and the server is UTC (Fly), late-evening PT requests see
+  // a "tomorrow" windowEnd that has no data yet — Amazon rows vanish even
+  // though they exist on disk. Using PT here keeps the dashboard correct
+  // regardless of where it's deployed.
+  const windowEnd = ptDaysAgo(1);
+  const windowStart = ptDaysAgo(windowDays);
 
   const salesInWindow = sales.filter((r) => r.date >= windowStart && r.date <= windowEnd);
   const marketingInWindow = marketing.filter((r) => r.date >= windowStart && r.date <= windowEnd);
@@ -225,9 +232,9 @@ export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketin
   // ---- Daily trend ----
   const trendMap = new Map<string, DailyTrendPoint>();
   // Pre-seed every day in [windowStart, windowEnd] so the chart never has gaps.
-  // Note: windowEnd is yesterday (today is excluded — see comment above).
+  // Note: windowEnd is yesterday-in-PT (today is excluded — see comment above).
   for (let i = 0; i < windowDays; i++) {
-    const d = isoDaysAgo(today, windowDays - i);
+    const d = ptDaysAgo(windowDays - i);
     trendMap.set(d, { date: d, revenue: 0, spend: 0, conversionValue: 0 });
   }
   salesInWindow.forEach((r) => {
@@ -447,6 +454,40 @@ function isoDaysAgo(d: Date, n: number): string {
   const x = new Date(d);
   x.setDate(x.getDate() - n);
   return isoDateOnly(x);
+}
+
+/**
+ * Returns YYYY-MM-DD that is `n` days before today *in Pacific Time*,
+ * regardless of where the server runs. Use this anywhere the dashboard's
+ * date window needs to align with the PT-anchored Sales Daily / Marketing
+ * Daily / Campaigns / Discounts tabs.
+ *
+ * Why hard-coded to America/Los_Angeles: HIKERS Co.'s Apps Script syncs
+ * are scheduled in PT (04:00–07:00 PT), and Shopify writes order dates
+ * using the shop's PT-set timezone. Computing "yesterday" in any other
+ * timezone causes the dashboard to look up dates that haven't been
+ * populated yet — the bug we hit on Fly (UTC) where the late-evening PT
+ * dashboard was looking for a date the next morning's sync hadn't yet
+ * written. If HIKERS ever changes business timezone, change this constant.
+ */
+const BUSINESS_TIMEZONE = 'America/Los_Angeles';
+function ptDaysAgo(n: number): string {
+  // Step 1: read today's date in BUSINESS_TIMEZONE as YYYY-MM-DD parts.
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: BUSINESS_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const [year, month, day] = fmt.format(new Date()).split('-').map(Number);
+  // Step 2: do the day arithmetic in UTC (no timezone shift now that we
+  // have the date parts as integers). UTC is just a clean calculator.
+  const d = new Date(Date.UTC(year, month - 1, day));
+  d.setUTCDate(d.getUTCDate() - n);
+  const y  = d.getUTCFullYear();
+  const m  = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
 }
 
 function sum<T>(arr: T[], fn: (x: T) => number): number {
