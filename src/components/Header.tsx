@@ -59,6 +59,12 @@ const NAV: NavGroup[] = [
       { href: '/cs', label: 'CS Dashboard' },
     ],
   },
+  {
+    label: 'Admin',
+    items: [
+      { href: '/sync', label: 'Sync' },
+    ],
+  },
 ];
 
 export function Header({ email }: HeaderProps) {
