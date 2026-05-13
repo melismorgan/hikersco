@@ -2071,3 +2071,411 @@ export async function loadLandedCost(): Promise<LandedCostRow[]> {
   out.sort((a, b) => a.sku.localeCompare(b.sku));
   return out;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// CS Dashboard — combines Gorgias tickets + CS Satisfaction + Judge.me
+// reviews + Amazon Returns into one customer-experience view.
+//
+// Source tabs:
+//   • CS Tickets       (40_gorgias_sync.gs)
+//   • CS Satisfaction  (40_gorgias_sync.gs)
+//   • Reviews          (41_judgeme_sync.gs) — published + moderated
+//   • Amazon Returns   (42_amazon_returns.gs)
+//
+// Important context (project_review_moderation_policy.md):
+// Melissa moderates sizing- and delivery-driven negative reviews into CS
+// exchanges. The published Judge.me feed under-represents true sizing
+// complaints. The dashboard surfaces published AND moderated rows so the
+// real signal is visible.
+// ─────────────────────────────────────────────────────────────────────────
+
+const CS_DASHBOARD_TICKETS_WINDOW_DAYS = 30;
+const CS_DASHBOARD_REVIEWS_WINDOW_DAYS = 90;
+const CS_DASHBOARD_TOP_FRICTION_LIMIT = 25;
+const CS_DASHBOARD_RECENT_REVIEWS_LIMIT = 12;
+const SIZING_CURVE_MIN_UNITS_SHIPPED = 50;     // suppress noise for tiny-volume Style+Color groups
+
+export interface CsTicketRow {
+  ticketId: string;
+  status: string;
+  channel: string;
+  via: string;
+  subject: string;
+  excerpt: string;
+  createdAt: string;
+  closedAt: string;
+  customerEmail: string;
+  customerName: string;
+  messagesCount: number;
+  tags: string[];          // split from comma-joined column
+  satisfactionScore: number | null;
+}
+
+export interface CsSatisfactionRow {
+  ticketId: string;
+  customerEmail: string;
+  scoredAt: string;
+  score: number;            // 1-5
+  comment: string;
+}
+
+export interface ReviewRow {
+  reviewId: string;
+  createdAt: string;
+  rating: number;
+  title: string;
+  body: string;
+  reviewerName: string;
+  verified: string;
+  source: string;
+  published: boolean;
+  productHandle: string;
+  productTitle: string;
+  hasReply: boolean;
+  hidden: boolean;
+}
+
+export interface AmazonReturnRow {
+  sku: string;
+  skuChannel: string;
+  style: string;
+  color: string;
+  size: string;
+  category: string;
+  productTitle: string;
+  unitsShipped: number;
+  returnUnits: number;
+  returnRate: number;       // 0..1
+  returnEvents: number;
+  handlingFee: number;
+  returnPostage: number;
+  reversal: number;
+  netReturnCost: number;
+  costPerUnitShipped: number;
+}
+
+export interface SizingHeatmapRow {
+  styleColor: string;       // "Style · Color"
+  style: string;
+  color: string;
+  cells: { size: string; rate: number; units: number }[];   // one per size with data
+  totalUnits: number;
+  totalReturns: number;
+  totalReturnRate: number;
+}
+
+export interface CsDashboardData {
+  generatedAt: string;
+  kpis: {
+    ticketVolume30d: number;
+    openTickets: number;
+    avgCsat90d: number | null;
+    csatResponseCount90d: number;
+    amazonReturnRate90d: number;
+    netReturnCost90d: number;
+    avgReviewRating90d: number | null;
+    pctReviews4PlusStar90d: number | null;
+    moderatedReviewCount90d: number;
+  };
+  topFrictionSkus: AmazonReturnRow[];                     // top N by return units
+  sizingHeatmap: SizingHeatmapRow[];                      // Style+Color rows × size cells
+  sizes: string[];                                        // ordered union of sizes appearing in heatmap
+  recentLowOrModeratedReviews: ReviewRow[];               // newest first
+  ticketTagMix: { tag: string; count: number }[];         // top 10 tags in window
+  ticketChannelMix: { channel: string; count: number }[]; // breakdown
+}
+
+/** Read the CS Tickets tab. Returns [] if the tab doesn't exist (graceful). */
+export async function readCsTickets(): Promise<CsTicketRow[]> {
+  let grid: string[][];
+  try {
+    grid = await readTab('CS Tickets');
+  } catch {
+    return [];
+  }
+  if (!grid || grid.length < 2) return [];
+  const out: CsTicketRow[] = [];
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    if (!r || !r[0]) continue;
+    const tagsCell = str(r[17]);
+    const tags = tagsCell ? tagsCell.split(',').map((t) => t.trim()).filter(Boolean) : [];
+    const sat = r[18];
+    out.push({
+      ticketId: str(r[0]),
+      status: str(r[2]),
+      channel: str(r[3]),
+      via: str(r[4]),
+      subject: str(r[5]),
+      excerpt: str(r[6]),
+      createdAt: str(r[7]),
+      closedAt: str(r[10]),
+      customerEmail: str(r[13]),
+      customerName: str(r[14]),
+      messagesCount: num(r[16]),
+      tags,
+      satisfactionScore: sat === '' || sat == null ? null : num(sat),
+    });
+  }
+  return out;
+}
+
+/** Read the CS Satisfaction tab. */
+export async function readCsSatisfaction(): Promise<CsSatisfactionRow[]> {
+  let grid: string[][];
+  try {
+    grid = await readTab('CS Satisfaction');
+  } catch {
+    return [];
+  }
+  if (!grid || grid.length < 2) return [];
+  const out: CsSatisfactionRow[] = [];
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    if (!r || !r[0]) continue;
+    out.push({
+      ticketId: str(r[1]),
+      customerEmail: str(r[2]),
+      scoredAt: str(r[4]),
+      score: num(r[5]),
+      comment: str(r[6]),
+    });
+  }
+  return out.filter((s) => s.score > 0);
+}
+
+/** Read the Reviews tab (Judge.me, includes published + moderated). */
+export async function readReviews(): Promise<ReviewRow[]> {
+  let grid: string[][];
+  try {
+    grid = await readTab('Reviews');
+  } catch {
+    return [];
+  }
+  if (!grid || grid.length < 2) return [];
+  const out: ReviewRow[] = [];
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    if (!r || !r[0]) continue;
+    out.push({
+      reviewId: str(r[0]),
+      createdAt: str(r[1]),
+      rating: num(r[3]),
+      title: str(r[4]),
+      body: str(r[5]),
+      reviewerName: str(r[6]),
+      verified: str(r[8]),
+      source: str(r[9]),
+      published: parseBool(r[10], true),       // default true if blank — back-compat with rows from before Published column existed
+      productHandle: str(r[12]),
+      productTitle: str(r[13]),
+      hasReply: parseBool(r[16], false),
+      hidden: parseBool(r[20], false),
+    });
+  }
+  return out;
+}
+
+/** Read the Amazon Returns tab. */
+export async function readAmazonReturns(): Promise<AmazonReturnRow[]> {
+  let grid: string[][];
+  try {
+    grid = await readTab('Amazon Returns');
+  } catch {
+    return [];
+  }
+  if (!grid || grid.length < 2) return [];
+  const out: AmazonReturnRow[] = [];
+  for (let i = 1; i < grid.length; i++) {
+    const r = grid[i];
+    if (!r || !r[0]) continue;
+    out.push({
+      sku: str(r[0]),
+      skuChannel: str(r[1]),
+      style: str(r[2]),
+      color: str(r[3]),
+      size: str(r[4]),
+      category: str(r[5]),
+      productTitle: str(r[6]),
+      unitsShipped: num(r[8]),
+      returnUnits: num(r[9]),
+      returnRate: num(r[10]),
+      returnEvents: num(r[11]),
+      handlingFee: num(r[12]),
+      returnPostage: num(r[13]),
+      reversal: num(r[14]),
+      netReturnCost: num(r[15]),
+      costPerUnitShipped: num(r[16]),
+    });
+  }
+  return out;
+}
+
+function parseBool(v: unknown, fallback: boolean): boolean {
+  if (v === null || v === undefined || v === '') return fallback;
+  if (typeof v === 'boolean') return v;
+  const s = String(v).trim().toLowerCase();
+  if (s === 'true' || s === '1' || s === 'yes') return true;
+  if (s === 'false' || s === '0' || s === 'no') return false;
+  return fallback;
+}
+
+/**
+ * Compute the CS Dashboard. Pulls all four source tabs in parallel and
+ * derives KPIs + the four visualization datasets. Pure read — no writes
+ * back to the workbook.
+ */
+export async function loadCsDashboard(): Promise<CsDashboardData> {
+  const [tickets, satisfaction, reviews, amazonReturns] = await Promise.all([
+    readCsTickets(),
+    readCsSatisfaction(),
+    readReviews(),
+    readAmazonReturns(),
+  ]);
+
+  const now = Date.now();
+  const dayMs = 86_400_000;
+  const ticketWindowStart = now - CS_DASHBOARD_TICKETS_WINDOW_DAYS * dayMs;
+  const reviewWindowStart = now - CS_DASHBOARD_REVIEWS_WINDOW_DAYS * dayMs;
+
+  // ─── Ticket KPIs ───
+  const ticketsInWindow = tickets.filter((t) => {
+    const ms = Date.parse(t.createdAt);
+    return !isNaN(ms) && ms >= ticketWindowStart;
+  });
+  const openTickets = tickets.filter((t) => t.status === 'open').length;
+
+  // ─── CSAT KPI (90d) ───
+  const csatInWindow = satisfaction.filter((s) => {
+    const ms = Date.parse(s.scoredAt);
+    return !isNaN(ms) && ms >= reviewWindowStart;
+  });
+  const avgCsat90d = csatInWindow.length > 0
+    ? csatInWindow.reduce((sum, s) => sum + s.score, 0) / csatInWindow.length
+    : null;
+
+  // ─── Amazon return KPI (90d, blended across all SKUs) ───
+  const totalUnitsShipped = amazonReturns.reduce((s, r) => s + r.unitsShipped, 0);
+  const totalReturnUnits = amazonReturns.reduce((s, r) => s + r.returnUnits, 0);
+  const amazonReturnRate90d = totalUnitsShipped > 0 ? totalReturnUnits / totalUnitsShipped : 0;
+  const netReturnCost90d = amazonReturns.reduce((s, r) => s + r.netReturnCost, 0);
+
+  // ─── Review KPIs (90d) ───
+  const reviewsInWindow = reviews.filter((rv) => {
+    const ms = Date.parse(rv.createdAt);
+    return !isNaN(ms) && ms >= reviewWindowStart;
+  });
+  const publishedInWindow = reviewsInWindow.filter((rv) => rv.published);
+  const moderatedInWindow = reviewsInWindow.filter((rv) => !rv.published);
+  const avgReviewRating90d = publishedInWindow.length > 0
+    ? publishedInWindow.reduce((s, r) => s + r.rating, 0) / publishedInWindow.length
+    : null;
+  const fourPlusStar = publishedInWindow.filter((r) => r.rating >= 4).length;
+  const pctReviews4PlusStar90d = publishedInWindow.length > 0
+    ? fourPlusStar / publishedInWindow.length
+    : null;
+
+  // ─── Top friction SKUs ───
+  const topFrictionSkus = [...amazonReturns]
+    .sort((a, b) => b.returnUnits - a.returnUnits)
+    .slice(0, CS_DASHBOARD_TOP_FRICTION_LIMIT);
+
+  // ─── Sizing curve heatmap ───
+  // Group by Style+Color, pivot Size as cells. Suppress groups with too
+  // little volume (would be noise — a single return looks like 100% rate
+  // on a SKU that shipped one unit).
+  const sizingGroups = new Map<string, AmazonReturnRow[]>();
+  for (const r of amazonReturns) {
+    if (!r.style || !r.color || !r.size) continue;
+    const key = `${r.style}|${r.color}`;
+    if (!sizingGroups.has(key)) sizingGroups.set(key, []);
+    sizingGroups.get(key)!.push(r);
+  }
+  const sizesUniverse = new Set<string>();
+  const sizingHeatmap: SizingHeatmapRow[] = [];
+  for (const [key, rows] of sizingGroups) {
+    const totalUnits = rows.reduce((s, r) => s + r.unitsShipped, 0);
+    if (totalUnits < SIZING_CURVE_MIN_UNITS_SHIPPED) continue;
+    const totalReturns = rows.reduce((s, r) => s + r.returnUnits, 0);
+    const cells = rows
+      .filter((r) => r.unitsShipped > 0)
+      .map((r) => {
+        sizesUniverse.add(r.size);
+        return { size: r.size, rate: r.returnRate, units: r.unitsShipped };
+      });
+    const [style, color] = key.split('|');
+    sizingHeatmap.push({
+      styleColor: `${style} · ${color}`,
+      style,
+      color,
+      cells,
+      totalUnits,
+      totalReturns,
+      totalReturnRate: totalUnits > 0 ? totalReturns / totalUnits : 0,
+    });
+  }
+  // Sort heatmap rows: highest blended return rate first (most-troubled at top)
+  sizingHeatmap.sort((a, b) => b.totalReturnRate - a.totalReturnRate);
+
+  // Order sizes naturally: XS, S, M, L, XL, 2X-5X (and OSFA at end as fallback)
+  const sizeOrder: Record<string, number> = {
+    'XS': 1, 'S': 2, 'M': 3, 'L': 4, 'XL': 5, '2X': 6, '3X': 7, '4X': 8, '5X': 9, 'OSFA': 99,
+  };
+  const sizes = [...sizesUniverse].sort((a, b) => {
+    const oa = sizeOrder[a] ?? 50;
+    const ob = sizeOrder[b] ?? 50;
+    if (oa !== ob) return oa - ob;
+    return a.localeCompare(b);
+  });
+
+  // ─── Recent low-rating + moderated reviews ───
+  // Show newest first; include both published 1-2★ and ALL moderated rows
+  // (regardless of rating — moderation reason matters more than star count).
+  const recentLowOrModeratedReviews = [...reviewsInWindow]
+    .filter((r) => !r.published || r.rating <= 2)
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+    .slice(0, CS_DASHBOARD_RECENT_REVIEWS_LIMIT);
+
+  // ─── Ticket tag mix (top 10) ───
+  const tagCounts = new Map<string, number>();
+  for (const t of ticketsInWindow) {
+    for (const tag of t.tags) {
+      tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+    }
+  }
+  const ticketTagMix = [...tagCounts.entries()]
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+
+  // ─── Ticket channel mix ───
+  const channelCounts = new Map<string, number>();
+  for (const t of ticketsInWindow) {
+    const ch = t.channel || '(unknown)';
+    channelCounts.set(ch, (channelCounts.get(ch) ?? 0) + 1);
+  }
+  const ticketChannelMix = [...channelCounts.entries()]
+    .map(([channel, count]) => ({ channel, count }))
+    .sort((a, b) => b.count - a.count);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    kpis: {
+      ticketVolume30d: ticketsInWindow.length,
+      openTickets,
+      avgCsat90d,
+      csatResponseCount90d: csatInWindow.length,
+      amazonReturnRate90d,
+      netReturnCost90d,
+      avgReviewRating90d,
+      pctReviews4PlusStar90d,
+      moderatedReviewCount90d: moderatedInWindow.length,
+    },
+    topFrictionSkus,
+    sizingHeatmap,
+    sizes,
+    recentLowOrModeratedReviews,
+    ticketTagMix,
+    ticketChannelMix,
+  };
+}

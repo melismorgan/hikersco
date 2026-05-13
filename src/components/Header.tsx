@@ -53,6 +53,12 @@ const NAV: NavGroup[] = [
       { href: '/costs', label: 'Costs' },
     ],
   },
+  {
+    label: 'Customer',
+    items: [
+      { href: '/cs', label: 'CS Dashboard' },
+    ],
+  },
 ];
 
 export function Header({ email }: HeaderProps) {
