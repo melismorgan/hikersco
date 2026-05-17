@@ -1094,11 +1094,39 @@ export async function loadPoSummaries(
  *
  * Internal transfers are excluded so we don't double-count: those move stock
  * from one of our locations to another, they don't bring new inventory.
+ *
+ * Per-SKU pro-rata receive: when a Shipment is set to Received, its line
+ * qtys are subtracted from the matching (PO #, SKU) Incoming rows in row
+ * order. Partial receipts drop the Next ETA total accordingly; a row only
+ * disappears from `incoming` once Received-shipment qtys fully cover it.
+ * Status writeback to the POs tab itself is done eagerly inside
+ * updateShipment / replaceShipmentLines / createShipment, but this read
+ * path is the source of truth for the dashboard even if those writes lag.
  */
 export async function readPoAggregates(): Promise<Map<string, PoAggregates>> {
-  const grid = await readTab('POs');
+  const [grid, shipments, shipLines] = await Promise.all([
+    readTab('POs'),
+    readShipments(),
+    readShipmentLines(),
+  ]);
   const out = new Map<string, PoAggregates>();
   if (grid.length < 2) return out;
+
+  // Sum Received-shipment line qtys per (poNumber, sku). Only Received-status
+  // shipments count — Planning/In Transit/Cancelled don't reduce on-the-water
+  // qty. We then consume this against Incoming PO rows in row order below.
+  const receivedBySkuPo = new Map<string, number>();
+  for (const sh of shipments.values()) {
+    if (sh.status !== 'Received') continue;
+    if (!sh.poNumber) continue;
+    const lines = shipLines.get(sh.shipmentId) ?? [];
+    for (const l of lines) {
+      if (!l.sku || l.qty <= 0) continue;
+      const key = `${sh.poNumber} ${l.sku}`;
+      receivedBySkuPo.set(key, (receivedBySkuPo.get(key) ?? 0) + l.qty);
+    }
+  }
+  const consumed = new Map<string, number>();
 
   for (const r of grid.slice(1)) {
     const status = str(r[1]).toLowerCase();
@@ -1111,19 +1139,32 @@ export async function readPoAggregates(): Promise<Map<string, PoAggregates>> {
 
     const agg = out.get(sku) ?? { inTransitAir: 0, inTransitSea: 0, draftPo: 0, incoming: [] };
     if (status === 'incoming') {
+      const poNumber = str(r[0]);
+      const key = `${poNumber} ${sku}`;
+      const available = receivedBySkuPo.get(key) ?? 0;
+      const already   = consumed.get(key) ?? 0;
+      const consume   = Math.min(qty, Math.max(available - already, 0));
+      consumed.set(key, already + consume);
+      const remaining = qty - consume;
+      if (remaining <= 0) {
+        // Fully covered by Received-shipment lines — line is effectively
+        // landed even if the POs tab still says Incoming. Skip it.
+        out.set(sku, agg);
+        continue;
+      }
       const eta = str(r[5]);
       // Date.parse handles ISO + most US-formatted dates; bad/blank ETAs
       // sort to the end so they don't masquerade as "next."
       const ts = eta ? Date.parse(eta) : NaN;
       agg.incoming.push({
-        poNumber: str(r[0]),
+        poNumber,
         mode: str(r[3]),
         eta,
         etaTimestamp: Number.isFinite(ts) ? ts : Number.MAX_SAFE_INTEGER,
-        qty,
+        qty: remaining,
       });
-      if (mode === 'air') agg.inTransitAir += qty;
-      else if (mode === 'sea') agg.inTransitSea += qty;
+      if (mode === 'air') agg.inTransitAir += remaining;
+      else if (mode === 'sea') agg.inTransitSea += remaining;
     } else if (status === 'draft') {
       agg.draftPo += qty;
     }

@@ -957,6 +957,72 @@ function validateShipmentFields(fields: ShipmentFields, requireAll: boolean): st
 }
 
 /**
+ * After a shipment changes (status flip, line edits, or new shipment) for
+ * one PO #, walk that PO's Incoming rows and flip to Received any whose qty
+ * is fully covered by Received-shipment line qtys for the same SKU.
+ *
+ * Per-SKU pro-rata: Received qty is consumed across the PO's Incoming rows
+ * in sheet-row order. A row is only flipped when fully consumed; partial
+ * receipts leave the row Incoming and the Apparel Stock dashboard handles
+ * the subtraction itself (see readPoAggregates in src/lib/inventory.ts).
+ *
+ * Does NOT un-flip already-Received rows when a Received shipment is later
+ * un-received — that's a manual cleanup on the POs page if you change your
+ * mind. Cheap to add later if it comes up.
+ */
+async function reconcilePoLinesAfterReceive(poNumber: string): Promise<void> {
+  const pn = (poNumber || '').trim();
+  if (!pn) return;
+
+  const [pos, shipments, shipLines] = await Promise.all([
+    readPos(),
+    readShipments(),
+    readShipmentLines(),
+  ]);
+
+  // Sum Received-shipment line qtys for THIS PO, per SKU.
+  const receivedBySku = new Map<string, number>();
+  for (const sh of shipments.values()) {
+    if (sh.poNumber !== pn) continue;
+    if (sh.status !== 'Received') continue;
+    const lines = shipLines.get(sh.shipmentId) ?? [];
+    for (const l of lines) {
+      if (!l.sku || l.qty <= 0) continue;
+      receivedBySku.set(l.sku, (receivedBySku.get(l.sku) ?? 0) + l.qty);
+    }
+  }
+  if (receivedBySku.size === 0) return;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const consumed = new Map<string, number>();
+  const cells: Array<{ range: string; value: string | number }> = [];
+
+  // Walk in sheet-row order so per-SKU consumption matches readPoAggregates
+  // exactly. Mismatched ordering would let the dashboard and the POs tab
+  // disagree about which row got "the" received qty.
+  const rows = pos
+    .filter((r) => r.poNumber === pn)
+    .sort((a, b) => a.rowIndex - b.rowIndex);
+
+  for (const r of rows) {
+    if (r.status !== 'Incoming') continue;
+    if ((r.type || '').toLowerCase() === 'internal transfer') continue;
+    if (!r.sku || r.qty <= 0) continue;
+    const available = receivedBySku.get(r.sku) ?? 0;
+    const already   = consumed.get(r.sku) ?? 0;
+    const consume   = Math.min(r.qty, Math.max(available - already, 0));
+    consumed.set(r.sku, already + consume);
+    if (consume < r.qty) continue;       // partial only — don't flip
+    cells.push({ range: `'POs'!B${r.rowIndex}`, value: 'Received' });
+    if (!r.receivedDate) {
+      cells.push({ range: `'POs'!J${r.rowIndex}`, value: today });
+    }
+  }
+  if (cells.length === 0) return;
+  await batchUpdateCells(cells);
+}
+
+/**
  * Create a new Shipment for a PO with optional initial line allocations.
  * Generates the next sequential SHP-NNNNN ID. Status defaults to 'Planning'.
  */
@@ -1010,8 +1076,21 @@ export async function createShipment(
       }
     }
   }
+  // Rare on create (status usually starts Planning), but if the user saves
+  // a brand-new shipment already at Received, auto-close any fully-covered
+  // PO lines so Apparel Stock matches.
+  if (status === 'Received') {
+    try {
+      await reconcilePoLinesAfterReceive(po);
+    } catch {
+      // Silent — shipment write already succeeded; user can re-save to retry.
+    }
+  }
   revalidatePath('/pos');
   revalidatePath('/cashflow');
+  revalidatePath('/dashboard');
+  revalidatePath('/accessories');
+  revalidatePath('/reorder');
   return { ok: true, shipmentId };
 }
 
@@ -1046,8 +1125,20 @@ export async function updateShipment(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
+  // After any shipment field change, reconcile against the parent PO — the
+  // status may have just flipped to Received, or the user may have edited
+  // a Received shipment's metadata in a way that affects nothing here but
+  // is cheap to re-check.
+  try {
+    await reconcilePoLinesAfterReceive(sh.poNumber);
+  } catch {
+    // Silent — shipment write already succeeded.
+  }
   revalidatePath('/pos');
   revalidatePath('/cashflow');
+  revalidatePath('/dashboard');
+  revalidatePath('/accessories');
+  revalidatePath('/reorder');
   return { ok: true };
 }
 
@@ -1085,7 +1176,20 @@ export async function replaceShipmentLines(
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   }
+  // Editing lines on a Received shipment changes consumption — recompute.
+  // Cheap to run unconditionally; reconcilePoLinesAfterReceive no-ops when
+  // the PO has no Received shipments yet.
+  try {
+    const ships = await readShipments();
+    const parent = ships.get(id);
+    if (parent?.poNumber) await reconcilePoLinesAfterReceive(parent.poNumber);
+  } catch {
+    // Silent — line write already succeeded.
+  }
   revalidatePath('/pos');
+  revalidatePath('/dashboard');
+  revalidatePath('/accessories');
+  revalidatePath('/reorder');
   return { ok: true };
 }
 
