@@ -26,6 +26,7 @@ const NAV: NavGroup[] = [
     label: 'Sales',
     items: [
       { href: '/marketing', label: 'Sales & Marketing' },
+      { href: '/sales', label: 'Seasonal Analysis' },
       { href: '/velocity', label: 'Velocity' },
       { href: '/events', label: 'Events' },
     ],

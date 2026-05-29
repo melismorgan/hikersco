@@ -13,7 +13,7 @@
 import { useMemo, useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import type { PoSummary, Shipment, ShipmentStatus } from '@/lib/inventory';
-import { deleteShipment } from '@/app/pos/actions';
+import { deleteShipment, exportShipmentWro } from '@/app/pos/actions';
 import { ShipmentEditor, ShipmentStatusPill } from './ShipmentEditor';
 
 interface Props {
@@ -32,6 +32,13 @@ export function ShipmentsView({ summaries }: Props) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // WRO CSV export state — kept separate from delete so the two banners
+  // don't clobber each other.
+  const [exportPending, startExport] = useTransition();
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportMissing, setExportMissing] = useState<string[]>([]);
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
 
   const [filter, setFilter] = useState<ShipmentStatus | 'All'>('All');
   const [query, setQuery] = useState('');
@@ -110,6 +117,40 @@ export function ShipmentsView({ summaries }: Props) {
     });
   }
 
+  // Generate the ShipBob WRO CSV for a shipment and download it in the
+  // browser. Blocked server-side if any SKU lacks a ShipBob Inventory ID —
+  // the missing SKUs come back so we can name them in the banner. Shipments
+  // with >100 SKUs come back as multiple files (ShipBob's import cap).
+  function handleExportWro(shipmentId: string) {
+    setExportError(null);
+    setExportMissing([]);
+    setExportMsg(null);
+    startExport(async () => {
+      const res = await exportShipmentWro(shipmentId);
+      if (!res.ok || !res.files || res.files.length === 0) {
+        setExportError(res.error ?? 'Export failed.');
+        setExportMissing(res.missingSkus ?? []);
+        return;
+      }
+      // Download each file. Multiple files happen when the shipment exceeds
+      // ShipBob's 100-record import limit; a short gap between them stops
+      // the browser from suppressing the later downloads.
+      for (let i = 0; i < res.files.length; i++) {
+        downloadCsv(res.files[i].filename, res.files[i].csv);
+        if (i < res.files.length - 1) await new Promise((r) => setTimeout(r, 500));
+      }
+      const totalRecords = res.files.reduce((a, f) => a + f.recordCount, 0);
+      setExportMsg(
+        res.files.length === 1
+          ? `Downloaded ${res.files[0].filename} (${totalRecords} SKUs). Upload it in ShipBob → ` +
+            `Receiving → Receiving Orders → Send Inventory → Midwest Hub → Import from CSV.`
+          : `${totalRecords} SKUs exceeds ShipBob's 100-record import limit, so this is split into ` +
+            `${res.files.length} files: ${res.files.map((f) => f.filename).join(', ')}. Create one WRO, ` +
+            `then run Import from CSV once per file in order — each adds its items to the same receiving order.`,
+      );
+    });
+  }
+
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -159,6 +200,19 @@ export function ShipmentsView({ summaries }: Props) {
 
       {deleteError && (
         <div className="rounded border border-ironclad/40 bg-ironclad/10 px-3 py-2 text-sm text-ironclad">{deleteError}</div>
+      )}
+
+      {exportError && (
+        <div className="rounded border border-ironclad/40 bg-ironclad/10 px-3 py-2 text-sm text-ironclad">
+          <div>{exportError}</div>
+          {exportMissing.length > 0 && (
+            <div className="mt-1 font-mono text-xs">{exportMissing.join(', ')}</div>
+          )}
+        </div>
+      )}
+
+      {exportMsg && (
+        <div className="rounded border border-sage/50 bg-sage/10 px-3 py-2 text-sm text-charcoal/80">{exportMsg}</div>
       )}
 
       <div className="rounded-lg border border-warm-gray/40 bg-warm-white">
@@ -218,8 +272,21 @@ export function ShipmentsView({ summaries }: Props) {
                         ? <>{fmtCurrency(s.shippingPaidAmount)} <span className="text-charcoal/50 text-[11px]">({s.shippingTxnCount} tx)</span></>
                         : <span className="text-charcoal/40">—</span>}
                     </Td>
-                    <Td className="text-right">
+                    <Td className="text-right whitespace-nowrap">
                       <button onClick={(e) => { e.stopPropagation(); setEditing(s); }} className="text-xs text-indigo hover:underline">Edit</button>
+                      {s.destination === 'ShipBob WI' && (
+                        <>
+                          <span className="mx-1 text-charcoal/30">·</span>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleExportWro(s.shipmentId); }}
+                            disabled={exportPending}
+                            title="Generate the ShipBob WRO CSV from this shipment's lines"
+                            className="text-xs text-indigo hover:underline disabled:opacity-40"
+                          >
+                            Export WRO
+                          </button>
+                        </>
+                      )}
                       <span className="mx-1 text-charcoal/30">·</span>
                       <button onClick={(e) => { e.stopPropagation(); handleDelete(s.shipmentId); }} disabled={pending} className="text-xs text-ironclad hover:underline disabled:opacity-40">Delete</button>
                     </Td>
@@ -360,4 +427,17 @@ function Td({ children, className = '', colSpan }: { children?: React.ReactNode;
 }
 function fmtCurrency(n: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n);
+}
+
+/** Trigger a browser download of a CSV file from in-memory text. */
+function downloadCsv(filename: string, csv: string): void {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }

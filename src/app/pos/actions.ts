@@ -11,6 +11,8 @@ import {
   readPoPaymentTransactions,
   readShipments,
   readShipmentLines,
+  readSkuMaster,
+  readShipbobFeed,
   readSuppliers,
   DEFAULT_DEPOSIT_PCT,
   type ShipmentStatus,
@@ -1249,4 +1251,149 @@ function buildSupplierPoRow({ poNumber, supplier, sku, qty, dest, unitCost, toda
     '',                  // P Dest On Hand
     '',                  // Q All-Day Total
   ];
+}
+
+// ---------------------------------------------------------------------------
+// ShipBob WRO (Warehouse Receiving Order) CSV export
+// ---------------------------------------------------------------------------
+
+/**
+ * ShipBob's WRO product-upload template — fixed 7-column format, confirmed
+ * 2026-04-22 from WRO_ProductUpload_Template_04-21-2026.csv. Box/carton
+ * config happens in the ShipBob UI after upload, so the CSV is purely
+ * SKU + qty. This is the Shipments-feature equivalent of the older
+ * POs-tab Apps Script generator in 17_shipbob_receiving.gs — one shipment
+ * (one destination, one mode) maps to exactly one WRO.
+ */
+const WRO_CSV_HEADER = [
+  'InventoryId',
+  'SKU',
+  'ItemName',
+  'IsLot (Yes/No value)',
+  'QuantityToSend',
+  'LotNumber',
+  'ExpirationDate',
+];
+
+/** ShipBob's CSV importer rejects any file with more than this many data
+ *  rows ("Only 100 records allowed to import"). Shipments with more SKUs
+ *  than this are split into multiple files, each imported in turn into the
+ *  same WRO. */
+const WRO_MAX_RECORDS = 100;
+
+/** RFC-4180-ish cell escaping: quote when the value has a comma, quote, CR or LF. */
+function wroCsvCell(v: string | number): string {
+  const s = v === null || v === undefined ? '' : String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/** One generated CSV file. A shipment yields more than one of these only
+ *  when its SKU count exceeds ShipBob's WRO_MAX_RECORDS import limit. */
+export interface WroExportFile {
+  /** Suggested download filename, e.g. shipbob_WRO_SHP-00012_20260520_1of2.csv */
+  filename: string;
+  /** Full CSV text (CRLF line endings) ready to be saved as a .csv file. */
+  csv: string;
+  /** Number of SKU data rows in this file (<= WRO_MAX_RECORDS). */
+  recordCount: number;
+}
+
+export interface WroExportResult {
+  ok: boolean;
+  /** Generated CSV file(s). Length is >1 when the shipment was split to
+   *  stay under ShipBob's 100-record-per-file import cap. */
+  files?: WroExportFile[];
+  /** Human-readable error when ok is false. */
+  error?: string;
+  /** SKUs with no ShipBob Inventory ID — populated when the export is blocked. */
+  missingSkus?: string[];
+}
+
+/**
+ * Build the ShipBob WRO CSV for a single shipment, from its saved line
+ * allocations on the Shipment Lines tab.
+ *
+ * The export is BLOCKED (ok:false, missingSkus populated) when any allocated
+ * SKU has no ShipBob Inventory ID in SKU Master col O — uploading those rows
+ * would create stray, unmatched items at ShipBob, so every line must be
+ * linked first. ShipBob-WI shipments only; AWD shipments use Amazon's
+ * inbound flow, not a WRO.
+ */
+export async function exportShipmentWro(
+  shipmentId: string,
+): Promise<WroExportResult> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, error: 'Not authenticated.' };
+
+  const id = (shipmentId || '').trim();
+  if (!id) return { ok: false, error: 'Shipment ID is required.' };
+
+  const [ships, lineMap] = await Promise.all([readShipments(), readShipmentLines()]);
+  const sh = ships.get(id);
+  if (!sh) return { ok: false, error: `Shipment ${id} not found.` };
+  if (sh.destination !== 'ShipBob WI') {
+    return {
+      ok: false,
+      error: `${id} ships to ${sh.destination || 'an unset destination'}. WRO CSVs are for ShipBob WI shipments only.`,
+    };
+  }
+
+  // Aggregate qty per SKU (defensive — a shipment normally has one row/SKU).
+  const qtyBySku = new Map<string, number>();
+  for (const l of lineMap.get(id) ?? []) {
+    if (!l.sku || l.qty <= 0) continue;
+    qtyBySku.set(l.sku, (qtyBySku.get(l.sku) ?? 0) + l.qty);
+  }
+  if (qtyBySku.size === 0) {
+    return { ok: false, error: `${id} has no line allocations to export.` };
+  }
+
+  // Resolve ShipBob Inventory ID (SKU Master col O) + ItemName (Shipbob Feed).
+  const [skuMaster, shipbobFeed] = await Promise.all([readSkuMaster(), readShipbobFeed()]);
+  const invIdBySku = new Map<string, string>();
+  for (const m of skuMaster) {
+    if (m.sku) invIdBySku.set(m.sku, (m.shipbobInventoryId || '').trim());
+  }
+
+  // Block: every SKU must carry a ShipBob Inventory ID before an upload.
+  const missingSkus = [...qtyBySku.keys()]
+    .filter((sku) => !invIdBySku.get(sku))
+    .sort();
+  if (missingSkus.length > 0) {
+    const one = missingSkus.length === 1;
+    return {
+      ok: false,
+      missingSkus,
+      error:
+        `${missingSkus.length} SKU${one ? '' : 's'} on ${id} ${one ? 'has' : 'have'} no ` +
+        `ShipBob Inventory ID in SKU Master (column O). Link ${one ? 'it' : 'them'} — ` +
+        `run HIKERS Tools → Refresh ShipBob, or paste the ID from the Shipbob Feed tab — ` +
+        `then export again.`,
+    };
+  }
+
+  // Build one data row per SKU, sorted for a stable, scannable file.
+  const dataRows: string[] = [];
+  for (const sku of [...qtyBySku.keys()].sort()) {
+    const invId = invIdBySku.get(sku) ?? '';
+    const itemName = shipbobFeed.get(invId)?.inventoryName ?? '';
+    dataRows.push([invId, sku, itemName, 'No', qtyBySku.get(sku) ?? 0, '', ''].map(wroCsvCell).join(','));
+  }
+
+  // ShipBob's importer caps a file at WRO_MAX_RECORDS data rows. Split into
+  // chunks of that size; each chunk is a self-contained CSV with its own
+  // header. One chunk -> a single unsuffixed filename; multiple chunks ->
+  // "_NofM" suffixes, imported in order into the same WRO.
+  const header = WRO_CSV_HEADER.join(',');
+  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const chunks: string[][] = [];
+  for (let i = 0; i < dataRows.length; i += WRO_MAX_RECORDS) {
+    chunks.push(dataRows.slice(i, i + WRO_MAX_RECORDS));
+  }
+  const files: WroExportFile[] = chunks.map((chunk, idx) => ({
+    filename: `shipbob_WRO_${id}_${stamp}${chunks.length > 1 ? `_${idx + 1}of${chunks.length}` : ''}.csv`,
+    csv: [header, ...chunk].join('\r\n') + '\r\n',
+    recordCount: chunk.length,
+  }));
+  return { ok: true, files };
 }

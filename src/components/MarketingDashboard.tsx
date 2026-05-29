@@ -36,19 +36,6 @@ export function MarketingDashboard({ data }: Props) {
         </span>
       </div>
 
-      {/* Integration-status notice — keep until everything is wired up. */}
-      <div className="rounded-md border border-clay/40 bg-clay/5 px-4 py-3 text-xs text-charcoal/80">
-        <span className="font-semibold text-clay">Heads-up:</span> some integrations are still pending and the numbers below reflect available data only.
-        <ul className="mt-1.5 ml-4 list-disc space-y-0.5">
-          <li>
-            <span className="font-medium">Google Ads</span> and <span className="font-medium">Amazon Ads</span> — awaiting API approval. Spend and attributed revenue from these channels are not yet included.
-          </li>
-          <li>
-            <span className="font-medium">Amazon orders</span> — Shopify revenue is fully populated; Amazon FBA/FBM is intermittent due to SP-API report queue delays. Catches up overnight.
-          </li>
-        </ul>
-      </div>
-
       {/* KPI strip — 6 tiles */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <Kpi
