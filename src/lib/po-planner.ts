@@ -235,6 +235,15 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
   const daysToLanding = daysBetweenIso(today, opts.thisPoLandsAt);
   const coverageWindowDays = daysBetweenIso(opts.thisPoLandsAt, opts.nextPoLandsAt);
 
+  // Precompute timestamp boundaries used by the incoming-PO partitioning.
+  // Declared up here (not inside the per-SKU computation) so they're
+  // initialized BEFORE the hoisted computePerSkuRow function is called by
+  // the for-loops below — otherwise we hit a temporal-dead-zone error.
+  // sumIncomingByEta compares via Date.parse-derived etaTimestamp so any
+  // ETA string format on the POs tab resolves correctly.
+  const thisPoLandsTs = new Date(opts.thisPoLandsAt + 'T23:59:59Z').getTime();
+  const nextPoLandsTs = new Date(opts.nextPoLandsAt + 'T23:59:59Z').getTime();
+
   // SKU universe (active by default) + supporting indexes.
   const apparelRows = apparel.filter((r) => includeInactive || r.active);
   const accessoryRows = accessories.filter((r) => includeInactive || r.active);
@@ -449,12 +458,6 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
 
   /* ===== Inner helper: per-SKU row computation =====
      Has access to all the outer state (eventsInWindow, velocityBySku, etc.) */
-  // Precompute the timestamp boundaries once — sumIncomingByEta compares
-  // via Date.parse-derived etaTimestamp values to be robust against any
-  // ETA string format on the POs tab.
-  const thisPoLandsTs = new Date(opts.thisPoLandsAt + 'T23:59:59Z').getTime();
-  const nextPoLandsTs = new Date(opts.nextPoLandsAt + 'T23:59:59Z').getTime();
-
   function computePerSkuRow(
     r: ApparelDashboardRow | AccessoriesDashboardRow,
     category: 'apparel' | 'accessories',
