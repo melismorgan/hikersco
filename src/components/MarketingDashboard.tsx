@@ -18,22 +18,37 @@ export function MarketingDashboard({ data }: Props) {
     windowStart,
     windowEnd,
     windowDays,
+    expectedWindowEnd,
+    windowEndIsStale,
   } = data;
+
+  // Headline label: when stale, swap "Yesterday" for "Last complete day"
+  // since windowEnd is no longer literally yesterday-in-PT.
+  const headline =
+    windowDays === 1
+      ? windowEndIsStale
+        ? `Last complete day · ${fmtDateLong(windowEnd)}`
+        : `Yesterday · ${fmtDateLong(windowEnd)}`
+      : `${fmtDateLong(windowStart)} – ${fmtDateLong(windowEnd)}`;
+
+  const subtext = windowEndIsStale
+    ? `Data through ${fmtDateLong(windowEnd)} · ${fmtDateLong(expectedWindowEnd)} not yet synced (morning sync runs 04:00–07:00 PT)`
+    : windowDays === 1
+      ? 'Single-day view · today excluded (partial-day data)'
+      : `${windowDays} complete days · ending yesterday · today excluded (partial-day data)`;
 
   return (
     <div className="space-y-8">
       {/* Date range banner */}
-      <div className="rounded-md bg-warm-tint border border-warm-gray/30 px-4 py-3 flex flex-wrap items-baseline gap-x-4 gap-y-1">
-        <span className="text-sm font-semibold text-charcoal">
-          {windowDays === 1
-            ? `Yesterday · ${fmtDateLong(windowEnd)}`
-            : `${fmtDateLong(windowStart)} – ${fmtDateLong(windowEnd)}`}
-        </span>
-        <span className="text-xs text-charcoal/60">
-          {windowDays === 1
-            ? 'Single-day view · today excluded (partial-day data)'
-            : `${windowDays} complete days · ending yesterday · today excluded (partial-day data)`}
-        </span>
+      <div
+        className={
+          windowEndIsStale
+            ? 'rounded-md bg-amber-50 border border-amber-300 px-4 py-3 flex flex-wrap items-baseline gap-x-4 gap-y-1'
+            : 'rounded-md bg-warm-tint border border-warm-gray/30 px-4 py-3 flex flex-wrap items-baseline gap-x-4 gap-y-1'
+        }
+      >
+        <span className="text-sm font-semibold text-charcoal">{headline}</span>
+        <span className="text-xs text-charcoal/60">{subtext}</span>
       </div>
 
       {/* KPI strip — 6 tiles */}

@@ -96,6 +96,12 @@ export interface SalesMarketingData {
   windowDays: number;
   windowStart: string;
   windowEnd: string;
+  /** What ptDaysAgo(1) returned — i.e. "yesterday in PT" by the clock. */
+  expectedWindowEnd: string;
+  /** True when windowEnd had to be pushed back because the morning sync
+   *  hasn't yet written rows for expectedWindowEnd. UI uses this to swap
+   *  the "Yesterday" label for "Last complete day" and warn the user. */
+  windowEndIsStale: boolean;
   totals: {
     netRevenue: number;
     grossRevenue: number;
@@ -155,8 +161,26 @@ export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketin
   // a "tomorrow" windowEnd that has no data yet — Amazon rows vanish even
   // though they exist on disk. Using PT here keeps the dashboard correct
   // regardless of where it's deployed.
-  const windowEnd = ptDaysAgo(1);
-  const windowStart = ptDaysAgo(windowDays);
+  //
+  // ALSO: there's a ~7-hour dead zone every night between PT-midnight and
+  // the 04:00–07:00 PT sync window where "yesterday in PT" exists by the
+  // clock but hasn't been written to the workbook yet. (Hit this 2026-06-01
+  // at 21:49 HST = 00:49 PT — banner said "Yesterday · Jun 1" but the
+  // morning sync hadn't run.)
+  //
+  // Detecting staleness via "any Sales Daily row exists for date X" doesn't
+  // work: 30_sales_daily_sync.gs's Shopify pull writes intraday rows tagged
+  // with the current PT date as orders come in, so ptYesterday always has
+  // partial rows by the time we hit the dead zone. And Amazon-only presence
+  // doesn't work either: 30_sales_daily_sync.gs only writes Amazon rows for
+  // dates with orders, so a zero-sales Amazon day would falsely flag as
+  // stale. So we use the clock instead: the morning sync window runs 04:00–
+  // 07:00 PT. After 08:00 PT we trust ptYesterday as complete. Before then,
+  // we clamp back one more day.
+  const expectedWindowEnd = ptDaysAgo(1);
+  const windowEndIsStale = ptHour() < SYNC_COMPLETE_HOUR_PT;
+  const windowEnd = windowEndIsStale ? isoDaysBefore(expectedWindowEnd, 1) : expectedWindowEnd;
+  const windowStart = isoDaysBefore(windowEnd, windowDays - 1);
 
   const salesInWindow = sales.filter((r) => r.date >= windowStart && r.date <= windowEnd);
   const marketingInWindow = marketing.filter((r) => r.date >= windowStart && r.date <= windowEnd);
@@ -232,9 +256,10 @@ export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketin
   // ---- Daily trend ----
   const trendMap = new Map<string, DailyTrendPoint>();
   // Pre-seed every day in [windowStart, windowEnd] so the chart never has gaps.
-  // Note: windowEnd is yesterday-in-PT (today is excluded — see comment above).
+  // Note: windowEnd is the clamped end (yesterday-in-PT, or earlier if the
+  // morning sync hasn't run yet — see comment above).
   for (let i = 0; i < windowDays; i++) {
-    const d = ptDaysAgo(windowDays - i);
+    const d = isoDaysBefore(windowEnd, windowDays - 1 - i);
     trendMap.set(d, { date: d, revenue: 0, spend: 0, conversionValue: 0 });
   }
   salesInWindow.forEach((r) => {
@@ -337,6 +362,8 @@ export async function loadSalesMarketing(windowDays = 30): Promise<SalesMarketin
     windowDays,
     windowStart,
     windowEnd,
+    expectedWindowEnd,
+    windowEndIsStale,
     totals: {
       netRevenue: round2(netRevenue),
       grossRevenue: round2(grossRevenue),
@@ -456,6 +483,18 @@ function isoDaysAgo(d: Date, n: number): string {
   return isoDateOnly(x);
 }
 
+/** Returns YYYY-MM-DD that is `n` days before the given YYYY-MM-DD string,
+ *  computed in pure UTC arithmetic so it's timezone-agnostic. */
+function isoDaysBefore(iso: string, n: number): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - n);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
 /**
  * Returns YYYY-MM-DD that is `n` days before today *in Pacific Time*,
  * regardless of where the server runs. Use this anywhere the dashboard's
@@ -471,6 +510,24 @@ function isoDaysAgo(d: Date, n: number): string {
  * written. If HIKERS ever changes business timezone, change this constant.
  */
 const BUSINESS_TIMEZONE = 'America/Los_Angeles';
+
+/** Hour (0–23) in PT after which we trust the daily morning sync to have
+ *  written rows for ptYesterday. The Apps Script triggers run 04:00–07:00
+ *  PT; 08:00 gives a 1-hour buffer. Lower this if the sync window changes. */
+const SYNC_COMPLETE_HOUR_PT = 8;
+
+/** Current hour in PT, 0–23. */
+function ptHour(): number {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: BUSINESS_TIMEZONE,
+    hour: '2-digit',
+    hour12: false,
+  });
+  // 'en-US' with hour12:false renders midnight as "24" in some Node versions;
+  // mod 24 normalizes that to 0.
+  return Number(fmt.format(new Date())) % 24;
+}
+
 function ptDaysAgo(n: number): string {
   // Step 1: read today's date in BUSINESS_TIMEZONE as YYYY-MM-DD parts.
   const fmt = new Intl.DateTimeFormat('en-CA', {
