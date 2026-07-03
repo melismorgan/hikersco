@@ -395,10 +395,20 @@ export function PoPlannerView({ plan }: Props) {
                       <td className="py-2 text-right tabular-nums">{r.currentDailyVelocity.toFixed(2)}</td>
                       <td className="py-2 text-right tabular-nums">{r.totalOnHandNow.toLocaleString()}</td>
                       <td className="py-2 text-right tabular-nums text-charcoal/70">−{Math.round(r.organicBurnToLanding + r.preLandingEventDemand).toLocaleString()}</td>
-                      <td className="py-2 text-right tabular-nums text-sage">+{r.arrivalsBeforeLanding.toLocaleString()}</td>
+                      <td className="py-2 text-right tabular-nums text-sage" title={fmtArrivalsTitle(r.arrivalsBeforeLandingDetail, r.arrivalsExcluded, 'before landing')}>
+                        +{r.arrivalsBeforeLanding.toLocaleString()}
+                        {((r.arrivalsBeforeLandingDetail?.length ?? 0) > 0 || (r.arrivalsExcluded?.length ?? 0) > 0) && (
+                          <span className="text-[10px] text-charcoal/40 ml-1">ⓘ</span>
+                        )}
+                      </td>
                       <td className="py-2 text-right tabular-nums font-medium">{Math.round(r.availableAtLanding).toLocaleString()}</td>
                       <td className="py-2 text-right tabular-nums">{Math.round(r.totalDemandInWindow).toLocaleString()}</td>
-                      <td className="py-2 text-right tabular-nums text-sage">+{r.arrivalsInWindow.toLocaleString()}</td>
+                      <td className="py-2 text-right tabular-nums text-sage" title={fmtArrivalsTitle(r.arrivalsInWindowDetail, [], 'in window')}>
+                        +{r.arrivalsInWindow.toLocaleString()}
+                        {(r.arrivalsInWindowDetail?.length ?? 0) > 0 && (
+                          <span className="text-[10px] text-charcoal/40 ml-1">ⓘ</span>
+                        )}
+                      </td>
                       <td className="py-2 text-right tabular-nums">{r.amzPlan > 0 ? r.amzPlan.toLocaleString() : <span className="text-charcoal/30">—</span>}</td>
                       <td className="py-2 text-right tabular-nums">{r.sbPlan > 0 ? r.sbPlan.toLocaleString() : <span className="text-charcoal/30">—</span>}</td>
                       <td className="py-2 text-right tabular-nums font-semibold text-indigo px-3">
@@ -439,4 +449,48 @@ function Kpi({ label, value, accent }: { label: string; value: string; accent?: 
 
 function fmtMoney(n: number): string {
   return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+}
+
+/**
+ * Format the per-PO incoming-arrivals breakdown as a multi-line title
+ * tooltip. Includes any excluded entries (eta unparseable or after the
+ * coverage window) so Melissa can spot a PO that she expected to count
+ * but the planner didn't.
+ *
+ * Defensive against undefined inputs — server data shape can drift during
+ * hot reload before the loader's new fields arrive on the client.
+ */
+function fmtArrivalsTitle(
+  detail: Array<{ poNumber: string; eta: string; qty: number; status?: 'Incoming' | 'Draft' }> | undefined,
+  excluded: Array<{ poNumber: string; eta: string; qty: number; reason: string; status?: 'Incoming' | 'Draft' }> | undefined,
+  label: string,
+): string {
+  const detailArr = detail ?? [];
+  const excludedArr = excluded ?? [];
+  const lines: string[] = [];
+  if (detailArr.length === 0 && excludedArr.length === 0) {
+    return `No incoming POs ${label}.`;
+  }
+  // Helper — tag Draft arrivals so Melissa can see "this PO isn't placed yet."
+  const tag = (s?: 'Incoming' | 'Draft') => (s === 'Draft' ? ' (Draft)' : '');
+  if (detailArr.length > 0) {
+    lines.push(`Arriving ${label}:`);
+    detailArr.forEach((d) => {
+      lines.push(`  ${d.poNumber || '(no PO #)'}${tag(d.status)}  ETA ${d.eta || '?'}  ${d.qty.toLocaleString()} units`);
+    });
+    // Hint when at least one row is a Draft — Melissa might want to move it to
+    // Incoming before treating the plan as final.
+    if (detailArr.some((d) => d.status === 'Draft')) {
+      lines.push('');
+      lines.push('Drafts are uncommitted POs from the app. Move them to Incoming once placed.');
+    }
+  }
+  if (excludedArr.length > 0) {
+    if (lines.length > 0) lines.push('');
+    lines.push('Excluded from this bucket:');
+    excludedArr.forEach((d) => {
+      lines.push(`  ${d.poNumber || '(no PO #)'}${tag(d.status)}  ETA ${d.eta || '?'}  ${d.qty.toLocaleString()} units — ${d.reason}`);
+    });
+  }
+  return lines.join('\n');
 }

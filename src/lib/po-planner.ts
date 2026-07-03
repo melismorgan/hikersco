@@ -102,6 +102,17 @@ export interface PlannedEvent {
   /** What the multiplier math suggests Expected Units should be. Sums the
    *  per-SKU expected event-driven demand across all linked SKUs. */
   suggestedExpectedUnits: number;
+  /** Manual multiplier from the Events-tab column. Used when no historical
+   *  multiplier is available (new launches, novel events). 0 = no override. */
+  manualMultiplier: number;
+  /** Halo multiplier applied to NON-linked SKUs during the event window —
+   *  captures the sitewide traffic bump from any campaign send. 0 = no halo. */
+  sitewideHalo: number;
+  /** Per-SKU Expected Units share for brand-new (zero-velocity) linked SKUs.
+   *  Computed once per event from existingExpectedUnits / zero-velocity-linked
+   *  count. Lets the planner size initial launch demand without a velocity
+   *  baseline. 0 = no fallback applied. */
+  zeroVelocityShare: number;
 }
 
 export interface PoCoverageRow {
@@ -128,9 +139,20 @@ export interface PoCoverageRow {
   /** In-transit + draft POs whose ETA is before thisPoLandsAt — i.e., supply
    *  that will land before the planned PO does. */
   arrivalsBeforeLanding: number;
+  /** Per-PO breakdown of the above, for UI tooltips so Melissa can audit
+   *  what's being counted (and spot a missing/mis-statused PO). The status
+   *  field lets the UI tag user-created drafts that haven't been moved to
+   *  Incoming yet. */
+  arrivalsBeforeLandingDetail: Array<{ poNumber: string; eta: string; qty: number; status: 'Incoming' | 'Draft' }>;
   /** In-transit + draft POs whose ETA is after thisPoLandsAt but before
    *  nextPoLandsAt — supply that will offset some of the demand window. */
   arrivalsInWindow: number;
+  /** Per-PO breakdown of the in-window arrivals. */
+  arrivalsInWindowDetail: Array<{ poNumber: string; eta: string; qty: number; status: 'Incoming' | 'Draft' }>;
+  /** Per-PO breakdown of incoming entries that landed OUTSIDE both buckets
+   *  (eta after nextPoLandsAt, or eta unparseable). Surfaced so a row that
+   *  Melissa expected to count but doesn't is debuggable from the UI. */
+  arrivalsExcluded: Array<{ poNumber: string; eta: string; qty: number; reason: string; status: 'Incoming' | 'Draft' }>;
 
   /** Days from today to thisPoLandsAt. */
   daysToLanding: number;
@@ -279,13 +301,17 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
       durationDays: daysBetweenIso(evStart, evEnd) || (er.windowLengthDays || 7),
       // Events-tab entries don't carry a multiplier by themselves; if the
       // name matches a calendar event, borrow its multiplier; else fall back
-      // to whatever Expected Units the user has set (treated as authoritative).
+      // to the user's Manual Multiplier (column X). Sitewide Halo (col Y)
+      // applies to non-linked SKUs regardless.
       multiplier: 1,                          // refined below
       hasMultiplier: false,                    // refined below
       linkedSkus: linked,
       source: 'events-tab',
       existingExpectedUnits: er.expectedUnits || 0,
       suggestedExpectedUnits: 0,               // computed in per-SKU pass
+      manualMultiplier: er.manualMultiplier || 0,
+      sitewideHalo: er.sitewideHaloMultiplier || 0,
+      zeroVelocityShare: 0,                    // computed below once SKU universe is fixed
     });
   }
 
@@ -350,6 +376,9 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
         source: 'calendar',
         existingExpectedUnits: 0,
         suggestedExpectedUnits: 0,
+        manualMultiplier: 0,                   // calendar events use their historical multiplier
+        sitewideHalo: 0,                       // halo is for Events-tab announcements, not seasonal calendar
+        zeroVelocityShare: 0,
       });
       calendarEventsCovered.add(evt.key + '-' + yr);
     }
@@ -357,10 +386,55 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
 
   eventsInWindow.sort((a, b) => a.start.localeCompare(b.start));
 
+  // Compute per-event zeroVelocityShare for launches with brand-new linked
+  // SKUs. Done once here so the per-SKU loop is O(events) instead of O(events
+  // × SKUs). For each event whose linked SKUs include zero-velocity entries
+  // AND has Expected Units > 0, split those units evenly across the new SKUs.
+  // Caveat: "evenly" is a starter heuristic — if a launch is skewed toward a
+  // hero color, Melissa can split into per-color events.
+  for (const ev of eventsInWindow) {
+    if (ev.existingExpectedUnits <= 0 || ev.linkedSkus.length === 0) continue;
+    let zeroVelCount = 0;
+    for (const s of ev.linkedSkus) {
+      if ((velocityBySku.get(s) ?? 0) === 0) zeroVelCount++;
+    }
+    if (zeroVelCount > 0) {
+      ev.zeroVelocityShare = ev.existingExpectedUnits / zeroVelCount;
+    }
+  }
+
   // Pre-landing events (between today and thisPoLandsAt) — surfaced per-SKU
   // as "pre-landing event demand" since they burn down inventory before the
-  // new PO arrives. Same source rules as above.
+  // new PO arrives. Includes both Events-tab rows (so a launch announced
+  // before landing isn't invisible to the burn-down) and SEASONAL_EVENTS.
   const preLandingEvents: PlannedEvent[] = [];
+
+  // First: Events-tab rows that overlap [today, thisPoLandsAt). Same shape
+  // as the in-window pass above so the per-SKU loop treats them identically.
+  for (const er of eventRows) {
+    if (!er.startDate) continue;
+    const evStart = er.startDate;
+    const evEnd = er.endDate || addDaysIso(evStart, er.windowLengthDays || 7);
+    if (evStart >= opts.thisPoLandsAt || evEnd <= today) continue;
+    const linked = Array.from(expandLinkedParents(er.linkedParents, allSkus));
+    preLandingEvents.push({
+      eventKey: er.eventId + '-pre',
+      eventName: er.name,
+      start: evStart,
+      end: evEnd,
+      durationDays: daysBetweenIso(evStart, evEnd) || (er.windowLengthDays || 7),
+      multiplier: 1,
+      hasMultiplier: false,
+      linkedSkus: linked,
+      source: 'events-tab',
+      existingExpectedUnits: er.expectedUnits || 0,
+      suggestedExpectedUnits: 0,
+      manualMultiplier: er.manualMultiplier || 0,
+      sitewideHalo: er.sitewideHaloMultiplier || 0,
+      zeroVelocityShare: 0,                    // resolved after the SEASONAL_EVENTS pass
+    });
+  }
+
   for (const evt of SEASONAL_EVENTS) {
     for (const yr of yearsToCheck) {
       const cw = eventWindowFor(evt, yr);
@@ -371,6 +445,21 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
       if (end <= today || start >= opts.thisPoLandsAt) continue;
       const eyo = seasonal.events.find((e) => e.key === evt.key);
       const m = chooseMultiplier(eyo, multiplierMode);
+      // De-dupe against any Events-tab pre-landing row already covering this
+      // calendar event (same 7-day fuzzy check we use for the in-window pass).
+      const dup = preLandingEvents.some((e) =>
+        e.source === 'events-tab' && absDaysBetweenIso(e.start, start) <= 7,
+      );
+      if (dup) {
+        const dupRow = preLandingEvents.find((e) =>
+          e.source === 'events-tab' && absDaysBetweenIso(e.start, start) <= 7,
+        );
+        if (dupRow && m !== null) {
+          dupRow.multiplier = m;
+          dupRow.hasMultiplier = true;
+        }
+        continue;
+      }
       preLandingEvents.push({
         eventKey: evt.key + '-pre-' + yr,
         eventName: evt.name,
@@ -383,7 +472,23 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
         source: 'calendar',
         existingExpectedUnits: 0,
         suggestedExpectedUnits: 0,
+        manualMultiplier: 0,
+        sitewideHalo: 0,
+        zeroVelocityShare: 0,
       });
+    }
+  }
+
+  // Resolve zeroVelocityShare on pre-landing Events-tab rows now that all
+  // events are gathered. Same logic as the in-window pass.
+  for (const ev of preLandingEvents) {
+    if (ev.existingExpectedUnits <= 0 || ev.linkedSkus.length === 0) continue;
+    let zeroVelCount = 0;
+    for (const s of ev.linkedSkus) {
+      if ((velocityBySku.get(s) ?? 0) === 0) zeroVelCount++;
+    }
+    if (zeroVelCount > 0) {
+      ev.zeroVelocityShare = ev.existingExpectedUnits / zeroVelCount;
     }
   }
 
@@ -465,19 +570,39 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
     const sku = r.sku;
     const velocity = velocityBySku.get(sku) ?? 0;
 
-    // Supply side: partition incoming POs into before/after landing.
-    const arrivalsBeforeLanding = sumIncomingByEta(r.incoming, (ts) => ts <= thisPoLandsTs);
-    const arrivalsInWindow = sumIncomingByEta(r.incoming, (ts) => ts > thisPoLandsTs && ts <= nextPoLandsTs);
+    // Supply side: partition incoming POs into before/after landing AND
+    // build per-PO detail lists for UI tooltips. The detail lists let
+    // Melissa audit what's being counted vs. silently excluded.
+    const arrivalsBeforeLandingDetail: Array<{ poNumber: string; eta: string; qty: number; status: 'Incoming' | 'Draft' }> = [];
+    const arrivalsInWindowDetail: Array<{ poNumber: string; eta: string; qty: number; status: 'Incoming' | 'Draft' }> = [];
+    const arrivalsExcluded: Array<{ poNumber: string; eta: string; qty: number; reason: string; status: 'Incoming' | 'Draft' }> = [];
+    let arrivalsBeforeLanding = 0;
+    let arrivalsInWindow = 0;
+    for (const p of r.incoming) {
+      const qty = Number(p.qty ?? 0) || 0;
+      if (qty <= 0) continue;
+      const entry = { poNumber: p.poNumber, eta: p.eta, qty, status: p.status };
+      if (!Number.isFinite(p.etaTimestamp) || p.etaTimestamp === Number.MAX_SAFE_INTEGER) {
+        arrivalsExcluded.push({ ...entry, reason: 'ETA missing or unparseable' });
+      } else if (p.etaTimestamp <= thisPoLandsTs) {
+        arrivalsBeforeLandingDetail.push(entry);
+        arrivalsBeforeLanding += qty;
+      } else if (p.etaTimestamp <= nextPoLandsTs) {
+        arrivalsInWindowDetail.push(entry);
+        arrivalsInWindow += qty;
+      } else {
+        arrivalsExcluded.push({ ...entry, reason: 'ETA after next PO landing' });
+      }
+    }
 
     // Pre-landing demand: organic burn + event spikes between today and landing.
     const organicBurnToLanding = velocity * organicDaysBeforeLanding;
     const preLandingEventDemand = preLandingEvents.reduce((s, ev) => {
-      const m = ev.hasMultiplier ? ev.multiplier : 1;
       const effDays = Math.max(0, daysBetweenIso(
         maxIso(ev.start, today),
         minIso(ev.end, opts.thisPoLandsAt),
       ));
-      return s + (velocity * m * effDays);
+      return s + computeEventDemandForSku(ev, sku, velocity, effDays);
     }, 0);
 
     const availableAtLanding = Math.max(
@@ -488,20 +613,21 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
         - preLandingEventDemand,
     );
 
-    // In-window demand: organic + per-event.
+    // In-window demand: organic + per-event. Per-event lift accounts for
+    // calendar multipliers (historical), Manual Multiplier (Events-tab user
+    // override), Sitewide Halo (non-linked SKUs), and Expected-Units
+    // distribution for brand-new zero-velocity linked SKUs — all via the
+    // computeEventDemandForSku helper so pre-landing and in-window stay in
+    // sync.
     const organicDemandInWindow = velocity * organicDaysInWindow;
     const perEventDemand: { eventKey: string; eventName: string; demand: number }[] = [];
     let inWindowEventDemand = 0;
     for (const ev of eventsInWindow) {
-      // If the event has explicit Linked Parents and this SKU isn't in them,
-      // the SKU is unaffected by the event (organic only).
-      if (ev.linkedSkus.length > 0 && !ev.linkedSkus.includes(sku)) continue;
-      const m = ev.hasMultiplier ? ev.multiplier : 1;
       const effDays = Math.max(0, daysBetweenIso(
         maxIso(ev.start, opts.thisPoLandsAt),
         minIso(ev.end, opts.nextPoLandsAt),
       ));
-      const skuDemand = velocity * m * effDays;
+      const skuDemand = computeEventDemandForSku(ev, sku, velocity, effDays);
       if (skuDemand > 0) {
         perEventDemand.push({ eventKey: ev.eventKey, eventName: ev.eventName, demand: round2(skuDemand) });
         inWindowEventDemand += skuDemand;
@@ -563,7 +689,10 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
       totalOnHandNow: r.totalOnHand,
       amazonOnHandNow: r.amazonTotal,
       arrivalsBeforeLanding: round2(arrivalsBeforeLanding),
+      arrivalsBeforeLandingDetail,
       arrivalsInWindow: round2(arrivalsInWindow),
+      arrivalsInWindowDetail,
+      arrivalsExcluded,
       daysToLanding,
       organicBurnToLanding: round2(organicBurnToLanding),
       preLandingEventDemand: round2(preLandingEventDemand),
@@ -585,6 +714,69 @@ export async function loadPoCoveragePlan(opts: LoadPoCoverageOpts): Promise<PoCo
 }
 
 /* ===== Helpers ===== */
+
+/**
+ * Resolve a single (event, sku) pair into a units-of-demand number for the
+ * effective day count. Honors, in priority order:
+ *
+ *   1. Linked + zero-velocity → use ev.zeroVelocityShare prorated over effDays
+ *      vs. ev.durationDays. This is the "brand-new launch SKU" path: we don't
+ *      have a velocity baseline so the planner consumes the Expected Units
+ *      share Melissa entered on the Events tab.
+ *   2. Linked + has velocity → velocity × bestMultiplier × effDays, where
+ *      bestMultiplier = calendar (if hasMultiplier) else Manual Multiplier
+ *      else 1. This is the "lift on an existing SKU during the announcement"
+ *      path.
+ *   3. NOT linked + sitewideHalo > 1 → velocity × sitewideHalo × effDays.
+ *      The across-the-board halo every announcement drives.
+ *   4. NOT linked + no halo OR event with empty linkedSkus → treat as
+ *      "applies to all SKUs" with the event's primary multiplier (preserves
+ *      the original calendar-event behavior for events without explicit Linked
+ *      Parents).
+ *
+ * Returns 0 (not negative, not NaN) when no path applies so callers can sum
+ * safely.
+ */
+function computeEventDemandForSku(
+  ev: PlannedEvent,
+  sku: string,
+  velocity: number,
+  effDays: number,
+): number {
+  if (effDays <= 0) return 0;
+  const hasLinkedScope = ev.linkedSkus.length > 0;
+  const skuIsLinked = hasLinkedScope && ev.linkedSkus.includes(sku);
+
+  if (hasLinkedScope && !skuIsLinked) {
+    // Non-linked SKU during a scoped event — only the halo applies, if set.
+    if (ev.sitewideHalo > 1 && velocity > 0) {
+      return velocity * ev.sitewideHalo * effDays;
+    }
+    return 0;
+  }
+
+  // Linked-scope OR all-SKUs event. Decide the multiplier.
+  const bestMultiplier = ev.hasMultiplier
+    ? ev.multiplier
+    : ev.manualMultiplier > 0
+      ? ev.manualMultiplier
+      : 1;
+
+  // Zero-velocity path: brand-new SKU in the linked set with Expected Units
+  // distribution available. Prorate the SKU's share over the slice of the
+  // event window we're looking at (effDays / durationDays).
+  if (
+    skuIsLinked &&
+    velocity === 0 &&
+    ev.zeroVelocityShare > 0 &&
+    ev.durationDays > 0
+  ) {
+    return ev.zeroVelocityShare * (effDays / ev.durationDays);
+  }
+
+  if (velocity === 0) return 0;
+  return velocity * bestMultiplier * effDays;
+}
 
 function chooseMultiplier(eyo: EventYoY | undefined, mode: MultiplierMode): number | null {
   if (!eyo) return null;

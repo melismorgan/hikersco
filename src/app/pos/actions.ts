@@ -1229,6 +1229,132 @@ export async function deleteShipment(
   return { ok: true };
 }
 
+/**
+ * Close a PO line as short — reduces the line's qty by `shortQty`, appends a
+ * dated note to the Notes column, flips status to Received, and stamps the
+ * Received Date if blank. One atomic batched write so the row never lands
+ * in a partial state. Used when a vendor underships and you've accepted the
+ * shortage rather than chasing the missing units.
+ *
+ * Validations:
+ *   - shortQty must be a positive integer
+ *   - shortQty must be < current line qty (closing 100% short = use Cancelled)
+ *   - line cannot already be Received or Cancelled (would be a no-op or
+ *     surprising rewrite — the user can edit those manually if needed)
+ *
+ * Note format: appended to existing Notes with a separator, so prior context
+ * is preserved. Example existing notes "Sea shipped 2026-04-19" becomes
+ * "Sea shipped 2026-04-19 | Vendor short 1 unit, closed 2026-05-26".
+ */
+export async function closePoLineAsShort(
+  rowIndex: number,
+  shortQty: number,
+): Promise<{ ok: boolean; error?: string; newQty?: number }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, error: 'Not authenticated.' };
+
+  if (!Number.isInteger(rowIndex) || rowIndex < 2) {
+    return { ok: false, error: 'Invalid row index.' };
+  }
+  if (!Number.isFinite(shortQty) || shortQty <= 0 || !Number.isInteger(shortQty)) {
+    return { ok: false, error: 'Short qty must be a positive integer.' };
+  }
+
+  const pos = await readPos();
+  const row = pos.find((r) => r.rowIndex === rowIndex);
+  if (!row) return { ok: false, error: `PO row ${rowIndex} not found.` };
+  if (row.status === 'Received' || row.status === 'Cancelled') {
+    return { ok: false, error: `Line is already ${row.status}; nothing to close.` };
+  }
+  if (shortQty >= row.qty) {
+    return {
+      ok: false,
+      error: `Short qty (${shortQty}) must be less than line qty (${row.qty}). For a full shortage, set status to Cancelled instead.`,
+    };
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const newQty = row.qty - shortQty;
+  const shortNote = `Vendor short ${shortQty} unit${shortQty === 1 ? '' : 's'}, closed ${today}`;
+  const combinedNotes = row.notes ? `${row.notes} | ${shortNote}` : shortNote;
+
+  const cells: Array<{ range: string; value: string | number }> = [
+    { range: `'POs'!B${rowIndex}`, value: 'Received' },
+    { range: `'POs'!H${rowIndex}`, value: newQty },
+    { range: `'POs'!K${rowIndex}`, value: combinedNotes },
+  ];
+  if (!row.receivedDate) {
+    cells.push({ range: `'POs'!J${rowIndex}`, value: today });
+  }
+
+  try {
+    await batchUpdateCells(cells);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+
+  revalidatePath('/pos');
+  revalidatePath('/dashboard');
+  revalidatePath('/accessories');
+  revalidatePath('/reorder');
+  return { ok: true, newQty };
+}
+
+/**
+ * Public-facing reconciler. Wraps reconcilePoLinesAfterReceive so the UI can
+ * trigger writeback on demand for POs whose shipments were marked Received
+ * before the auto-reconcile shipped, or whose previous auto-reconcile failed
+ * silently (the catch around the reconcile call in createShipment /
+ * updateShipment / replaceShipmentLines swallows transient Sheets errors so
+ * the user's edit isn't blocked, but that means stuck Incoming rows can pile
+ * up if Sheets blips during a Receive).
+ *
+ * Idempotent — running twice has the same effect as once.
+ *
+ * - poNumber given → reconcile only that PO.
+ * - poNumber omitted/blank → walk every PO with at least one Received
+ *   shipment and reconcile each. Useful as a global "heal everything" button.
+ *
+ * Returns counts so the UI can confirm what happened. `linesFlipped` is the
+ * number of POs-tab status writebacks that fired across all reconciled POs.
+ */
+export async function reconcileReceivedPoLines(
+  poNumber?: string,
+): Promise<{ ok: boolean; reconciledPos: number; error?: string }> {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return { ok: false, reconciledPos: 0, error: 'Not authenticated.' };
+
+  const target = (poNumber || '').trim();
+  try {
+    if (target) {
+      await reconcilePoLinesAfterReceive(target);
+      revalidatePath('/pos');
+      revalidatePath('/dashboard');
+      revalidatePath('/accessories');
+      revalidatePath('/reorder');
+      return { ok: true, reconciledPos: 1 };
+    }
+    // No PO# — heal every PO that has at least one Received shipment.
+    const shipments = await readShipments();
+    const posWithReceived = new Set<string>();
+    for (const sh of shipments.values()) {
+      if (sh.status === 'Received' && sh.poNumber) posWithReceived.add(sh.poNumber);
+    }
+    let count = 0;
+    for (const pn of posWithReceived) {
+      await reconcilePoLinesAfterReceive(pn);
+      count++;
+    }
+    revalidatePath('/pos');
+    revalidatePath('/dashboard');
+    revalidatePath('/accessories');
+    revalidatePath('/reorder');
+    return { ok: true, reconciledPos: count };
+  } catch (e) {
+    return { ok: false, reconciledPos: 0, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 function buildSupplierPoRow({ poNumber, supplier, sku, qty, dest, unitCost, today, note }: {
   poNumber: string; supplier?: string; sku: string; qty: number; dest: string; unitCost: number; today: string; note: string;
 }): (string | number)[] {

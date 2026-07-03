@@ -14,7 +14,8 @@ import { useEffect, useState } from 'react';
  *     time, error message if any.
  *
  * Status response shape (from Apps Script doGet):
- *   { ok: true, pending: boolean, lastRun: LastRun | null }
+ *   { ok: true, pending: boolean, lastRun: LastRun | null,
+ *     freshness: Record<handlerName, FreshnessEntry> | null }
  *
  * Run response shape (from Apps Script doPost):
  *   { ok: true, scheduledAt: string, expectedSyncs: string[], message: string }
@@ -38,10 +39,26 @@ interface LastRun {
   results: SyncResult[];
 }
 
+/**
+ * Per-sync freshness record, written by BOTH the daily *Safe trigger
+ * wrappers and the orchestrator (_stampSyncResult_ in 08_velocity.gs).
+ * Keyed by bare handler name. This is the truth for "when did each sync
+ * last succeed" — lastRun only reflects manual "Sync all now" runs, which
+ * is why the old page showed a week-old date while daily syncs ran fine.
+ */
+interface FreshnessEntry {
+  label: string;
+  lastSuccessAt?: string;
+  lastDurationMs?: number;
+  lastFailureAt?: string;
+  lastError?: string;
+}
+
 interface StatusResponse {
   ok: boolean;
   pending?: boolean;
   lastRun?: LastRun | null;
+  freshness?: Record<string, FreshnessEntry> | null;
   error?: string;
 }
 
@@ -99,6 +116,13 @@ export function SyncView() {
 
   const pending = !!status?.pending;
   const lastRun = status?.lastRun ?? null;
+  const freshness = status?.freshness ?? null;
+  // Stable order: most-recently-succeeded last, so stale ones float to top.
+  const freshnessRows = freshness
+    ? Object.entries(freshness).sort(([, a], [, b]) =>
+        (a.lastSuccessAt ?? '').localeCompare(b.lastSuccessAt ?? '')
+      )
+    : [];
 
   return (
     <div className="space-y-6">
@@ -131,14 +155,68 @@ export function SyncView() {
         )}
       </div>
 
-      {/* Last run summary */}
+      {/* Per-sync freshness — daily triggers + manual runs combined */}
+      {freshnessRows.length > 0 && (
+        <div className="rounded-lg border border-warm-gray/60 bg-warm-white">
+          <div className="px-6 py-4 border-b border-warm-gray/30">
+            <h2 className="font-display text-lg">Sync freshness</h2>
+            <p className="text-xs text-charcoal/60 mt-0.5">
+              Last successful run per source — scheduled and manual. Anything over 26h is stale.
+            </p>
+          </div>
+          <table className="w-full text-sm">
+            <tbody>
+              {freshnessRows.map(([fn, f]) => {
+                const staleness = stalenessOf(f.lastSuccessAt);
+                const failedSince =
+                  f.lastFailureAt &&
+                  (!f.lastSuccessAt || f.lastFailureAt > f.lastSuccessAt);
+                return (
+                  <tr key={fn} className="border-b border-warm-gray/20 last:border-b-0">
+                    <td className="px-6 py-2.5 w-8 text-center align-top">
+                      {staleness === 'fresh' && !failedSince && <span className="text-charcoal">✓</span>}
+                      {staleness === 'fresh' && failedSince && <span className="text-clay">⚠</span>}
+                      {staleness === 'stale' && <span className="text-clay">⚠</span>}
+                      {staleness === 'dead' && <span className="text-ironclad">✗</span>}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="font-medium">{f.label}</div>
+                      <div className="text-[11px] text-charcoal/50 font-mono">{fn}</div>
+                      {failedSince && f.lastError && (
+                        <div className="text-[11px] text-ironclad mt-1 font-mono whitespace-pre-wrap">
+                          last run failed: {f.lastError}
+                        </div>
+                      )}
+                    </td>
+                    <td
+                      className={
+                        'px-6 py-2.5 text-right tabular-nums align-top ' +
+                        (staleness === 'dead'
+                          ? 'text-ironclad font-medium'
+                          : staleness === 'stale'
+                            ? 'text-clay font-medium'
+                            : 'text-charcoal/60')
+                      }
+                    >
+                      {f.lastSuccessAt ? fmtRelative(f.lastSuccessAt) : 'never'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Last manual run summary */}
       {lastRun ? (
         <div className="rounded-lg border border-warm-gray/60 bg-warm-white">
           <div className="px-6 py-4 border-b border-warm-gray/30 flex items-baseline justify-between flex-wrap gap-2">
             <div>
-              <h2 className="font-display text-lg">Last sync</h2>
+              <h2 className="font-display text-lg">Last manual sync</h2>
               <p className="text-xs text-charcoal/60 mt-0.5">
-                {fmtRelative(lastRun.finishedAt)} · {lastRun.durationSec}s total
+                {fmtRelative(lastRun.finishedAt)} · {lastRun.durationSec}s total ·{' '}
+                &ldquo;Sync all now&rdquo; runs only — daily triggers appear above
               </p>
             </div>
             <div className="text-sm flex gap-4 tabular-nums">
@@ -188,6 +266,21 @@ export function SyncView() {
       )}
     </div>
   );
+}
+
+/**
+ * Freshness buckets. Daily triggers run every 24h, and Apps Script's
+ * nearMinute() jitter is ±15 min, so anything under 26h is on schedule.
+ * 26–48h = missed one run (warn). Over 48h = missed multiple (alarm).
+ * A handler killed by the 6-min execution cap stamps nothing, so repeated
+ * timeouts surface here as staleness even though no error email fires.
+ */
+function stalenessOf(lastSuccessAt?: string): 'fresh' | 'stale' | 'dead' {
+  if (!lastSuccessAt) return 'dead';
+  const hrs = (Date.now() - new Date(lastSuccessAt).getTime()) / 3600000;
+  if (hrs < 26) return 'fresh';
+  if (hrs < 48) return 'stale';
+  return 'dead';
 }
 
 function fmtRelative(iso: string): string {

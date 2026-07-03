@@ -3,7 +3,7 @@
 import { useMemo, useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import type { PoRow } from '@/lib/inventory';
-import { createPo, updatePo, bulkUpdatePos, bulkCancelPos, deletePos, type PoUpdateFields } from '@/app/pos/actions';
+import { createPo, updatePo, bulkUpdatePos, bulkCancelPos, deletePos, reconcileReceivedPoLines, closePoLineAsShort, type PoUpdateFields } from '@/app/pos/actions';
 
 interface Props {
   rows: PoRow[];
@@ -112,12 +112,15 @@ export function PosView({ rows }: Props) {
               className="flex-1 min-w-[200px] max-w-md px-3 py-2 rounded-md border border-warm-gray/60 bg-warm-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo/40"
             />
           </div>
-          <button
-            onClick={() => setShowForm((v) => !v)}
-            className="px-4 py-2 rounded-md bg-indigo text-warm-white text-sm font-medium hover:bg-indigo/90"
-          >
-            {showForm ? 'Close form' : '+ New PO'}
-          </button>
+          <div className="flex items-center gap-2">
+            <ReconcileButton />
+            <button
+              onClick={() => setShowForm((v) => !v)}
+              className="px-4 py-2 rounded-md bg-indigo text-warm-white text-sm font-medium hover:bg-indigo/90"
+            >
+              {showForm ? 'Close form' : '+ New PO'}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -476,7 +479,83 @@ function EditPoModal({ po, onClose }: { po: PoRow; onClose: () => void }) {
             {pending ? 'Saving…' : 'Save'}
           </button>
         </div>
+        <CloseAsShortPanel po={po} onDone={onClose} />
       </form>
+    </div>
+  );
+}
+
+/**
+ * "Close as short" — for the vendor-undershipped case. Pops below the main
+ * Save row inside EditPoModal so it's discoverable but not in the way for
+ * routine edits. Hidden when the line is already Received or Cancelled.
+ */
+function CloseAsShortPanel({ po, onDone }: { po: PoRow; onDone: () => void }) {
+  const router = useRouter();
+  const [pending, startTransition] = useTransition();
+  const [shortQty, setShortQty] = useState('1');
+  const [error, setError] = useState<string | null>(null);
+
+  // Only useful for active lines — hide on Received / Cancelled rows.
+  if (po.status === 'Received' || po.status === 'Cancelled') return null;
+
+  const onClose = () => {
+    setError(null);
+    const n = Number(shortQty);
+    if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
+      setError('Short qty must be a positive integer.');
+      return;
+    }
+    if (n >= po.qty) {
+      setError(`Short qty (${n}) must be less than line qty (${po.qty}). Use Cancelled for a 100% shortage.`);
+      return;
+    }
+    startTransition(async () => {
+      const res = await closePoLineAsShort(po.rowIndex, n);
+      if (!res.ok) {
+        setError(res.error ?? 'Close failed.');
+        return;
+      }
+      onDone();
+      router.refresh();
+    });
+  };
+
+  return (
+    <div className="border-t border-warm-gray/40 pt-3 mt-1">
+      <div className="text-xs text-charcoal/60 mb-2">
+        Close this line short — for when the vendor under-shipped and you&rsquo;ve accepted the loss.
+        Reduces qty, appends a dated note, flips status to Received.
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <label className="text-sm text-charcoal/80">
+          Short qty:
+          <input
+            type="number"
+            min="1"
+            step="1"
+            value={shortQty}
+            onChange={(e) => setShortQty(e.target.value)}
+            className="ml-2 w-20 px-2 py-1 rounded border border-warm-gray/60 bg-warm-white text-sm tabular-nums"
+          />
+        </label>
+        <span className="text-xs text-charcoal/50">
+          line qty {po.qty.toLocaleString()} → {Math.max(0, po.qty - Number(shortQty || 0)).toLocaleString()}
+        </span>
+        <button
+          type="button"
+          onClick={onClose}
+          disabled={pending}
+          className="px-3 py-1.5 rounded-md border border-warm-gray/60 bg-warm-white text-sm hover:bg-warm-beige/40 disabled:opacity-50"
+        >
+          {pending ? 'Closing…' : 'Close as short'}
+        </button>
+      </div>
+      {error && (
+        <div className="mt-2 rounded border border-ironclad/40 bg-ironclad/5 px-3 py-1.5 text-xs text-ironclad">
+          {error}
+        </div>
+      )}
     </div>
   );
 }
@@ -630,4 +709,56 @@ function Td({ children, className = '' }: { children: React.ReactNode; className
 }
 function fmtCurrency(n: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n);
+}
+
+/**
+ * Reconcile button — walks every PO with at least one Received shipment and
+ * flips fully-covered Incoming PO lines to Received. Idempotent; safe to
+ * click anytime. Surfaces a small inline result message after running so
+ * Melissa knows how many POs were touched.
+ *
+ * Why this exists: the auto-reconcile that fires after createShipment /
+ * updateShipment / replaceShipmentLines can silently fail (Sheets timeouts,
+ * etc.), leaving Received-via-Shipments PO lines stuck at Incoming on the
+ * POs tab. The Coverage Planner handles this correctly via in-memory
+ * subtraction, but the /pos page reads col B straight off the sheet. This
+ * button is the manual escape hatch.
+ */
+function ReconcileButton() {
+  const router = useRouter();
+  const [pending, startTransition] = useTransition();
+  const [result, setResult] = useState<string | null>(null);
+
+  const run = () => {
+    setResult(null);
+    startTransition(async () => {
+      const res = await reconcileReceivedPoLines();
+      if (!res.ok) {
+        setResult(`Failed: ${res.error ?? 'unknown error'}`);
+        return;
+      }
+      setResult(
+        res.reconciledPos === 0
+          ? 'Nothing to reconcile — no Received shipments found.'
+          : `Reconciled ${res.reconciledPos} PO${res.reconciledPos === 1 ? '' : 's'}.`,
+      );
+      router.refresh();
+    });
+  };
+
+  return (
+    <div className="flex items-center gap-2">
+      {result && (
+        <span className="text-xs text-charcoal/70">{result}</span>
+      )}
+      <button
+        onClick={run}
+        disabled={pending}
+        title="Walks every PO with Received shipments and flips fully-covered line items to Received. Safe to click anytime."
+        className="px-3 py-2 rounded-md border border-warm-gray/60 bg-warm-white text-sm hover:bg-warm-beige/40 disabled:opacity-50"
+      >
+        {pending ? 'Reconciling…' : 'Reconcile received lines'}
+      </button>
+    </div>
+  );
 }

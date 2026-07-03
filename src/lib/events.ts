@@ -62,7 +62,7 @@
  *   W Result Notes             (post-mortem text)
  */
 
-import { appendRows, ensureTabExists, readTab } from './sheets';
+import { appendRows, batchUpdateCells, ensureTabExists, readTab } from './sheets';
 
 // ---- Types ----------------------------------------------------------------
 
@@ -105,6 +105,15 @@ export interface EventRow {
   newSkus: string;
   discountPct: number;
   expectedUnits: number;
+  /** Multiplier applied to linked SKUs during the event window when no
+   *  calendar-event multiplier is available (e.g., launches, novel events).
+   *  0 / blank = "no manual override; planner falls back to organic baseline."
+   *  Typical values: 2.0–4.0 for an announcement, 3.0–6.0 for a promo. */
+  manualMultiplier: number;
+  /** Smaller across-the-board lift applied to NON-linked SKUs during the
+   *  event window — captures the halo/site-traffic bump every campaign drives.
+   *  0 / blank = no halo applied. Typical: 1.1–1.3. */
+  sitewideHaloMultiplier: number;
   notes: string;
   excludeFromVelocityAvg: boolean;
   // Result fields (filled in post-event, optional):
@@ -147,6 +156,11 @@ const HEADER_ROW: string[] = [
   'New SKU First-Window Units',
   'Gross Revenue',
   'Result Notes',
+  // Appended for backward compat — new cols sit at the end so existing data
+  // rows don't have to shift. ensureEventsTab() writes the missing header
+  // cells on first read if the sheet already exists.
+  'Manual Multiplier',
+  'Sitewide Halo Multiplier',
 ];
 
 /** Heavy Duty restock + new colors campaign — seeded so the schema has a
@@ -170,6 +184,8 @@ const SEED_HEAVY_DUTY_ROW: (string | number)[] = [
   'Auto-seeded. Update Start Date once email is scheduled. Expected Units feeds Reorder spike math.',
   'Y',                                         // Exclude From Velocity Avg
   '', '', '', '', '', '', '', '', '',          // Result columns blank until window closes
+  '',                                          // Manual Multiplier — leave blank, Melissa fills
+  1.2,                                         // Sitewide Halo Multiplier — typical announcement halo
 ];
 
 // ---- Tab init -------------------------------------------------------------
@@ -205,9 +221,38 @@ export async function ensureEventsTab(): Promise<void> {
     const looksLikeHeader = firstRow.length > 0 && String(firstRow[0] ?? '').trim() === 'Event ID';
     if (!looksLikeHeader && grid.length === 0) {
       await appendRows(EVENTS_TAB, [HEADER_ROW]);
+      return;
+    }
+    // Backfill missing header cells when HEADER_ROW grows past the existing
+    // header. Keeps Melissa's data rows where they are while still showing
+    // the new column labels at the right edge. Idempotent — re-running this
+    // after a partial backfill just writes whatever's still missing.
+    if (looksLikeHeader && firstRow.length < HEADER_ROW.length) {
+      const updates: Array<{ range: string; value: string | number }> = [];
+      for (let col = firstRow.length; col < HEADER_ROW.length; col++) {
+        updates.push({
+          range: `${EVENTS_TAB}!${colLetter(col)}1`,
+          value: HEADER_ROW[col],
+        });
+      }
+      if (updates.length > 0) {
+        await batchUpdateCells(updates);
+      }
     }
   })();
   return _initPromise;
+}
+
+/** A=0, B=1, ..., Z=25, AA=26, AB=27, ... Handles two-letter columns even
+ *  though we don't currently need them, so future appends are safe. */
+function colLetter(zeroBasedIndex: number): string {
+  let n = zeroBasedIndex;
+  let out = '';
+  do {
+    out = String.fromCharCode(65 + (n % 26)) + out;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return out;
 }
 
 // ---- Reader ---------------------------------------------------------------
@@ -366,6 +411,10 @@ export async function readEvents(): Promise<EventRow[]> {
       newSkuFirstWindowUnits: num(r[20]),
       grossRevenue:           num(r[21]),
       resultNotes:            str(r[22]),
+      // Appended cols — safe on legacy rows because num(undefined) === 0,
+      // which the planner reads as "no override; use organic baseline."
+      manualMultiplier:       num(r[23]),
+      sitewideHaloMultiplier: num(r[24]),
     });
   }
   return out;

@@ -184,13 +184,18 @@ export interface PoAggregates {
   incoming: IncomingPoLine[];
 }
 
-/** A single Incoming PO line attached to a SKU, used for ETA display. */
+/** A single Incoming PO line attached to a SKU, used for ETA display.
+ *  status='Draft' entries are uncommitted POs the user created in the app
+ *  but hasn't moved to Incoming yet. They're surfaced in the planner so
+ *  user-created drafts with ETAs aren't invisible, but the UI flags them
+ *  with a badge so Melissa can see "this isn't a confirmed order." */
 export interface IncomingPoLine {
   poNumber: string;
   mode: string;       // 'Air' | 'Sea' | other
   eta: string;        // raw string from sheet
   etaTimestamp: number; // Date.parse(eta), or Number.MAX_SAFE_INTEGER if unparsable
   qty: number;
+  status: 'Incoming' | 'Draft';
 }
 
 /**
@@ -1115,17 +1120,45 @@ export async function readPoAggregates(): Promise<Map<string, PoAggregates>> {
   // Sum Received-shipment line qtys per (poNumber, sku). Only Received-status
   // shipments count — Planning/In Transit/Cancelled don't reduce on-the-water
   // qty. We then consume this against Incoming PO rows in row order below.
+  // We also build a per-(po, sku) list of non-Received shipment allocations
+  // so we can fall back to the Shipment's ETA when the POs-tab line item
+  // has no ETA filled in. That matches Melissa's workflow: she usually
+  // leaves col F blank until freight is booked, then enters the ETA on
+  // the Shipments tab. Without this join, those PO lines looked like
+  // 'ETA missing' forever to the planner.
   const receivedBySkuPo = new Map<string, number>();
+  type ShipAlloc = { shipmentId: string; eta: string; etaTs: number; mode: string; qty: number };
+  const allocBySkuPo = new Map<string, ShipAlloc[]>();
   for (const sh of shipments.values()) {
-    if (sh.status !== 'Received') continue;
     if (!sh.poNumber) continue;
     const lines = shipLines.get(sh.shipmentId) ?? [];
-    for (const l of lines) {
-      if (!l.sku || l.qty <= 0) continue;
-      const key = `${sh.poNumber} ${l.sku}`;
-      receivedBySkuPo.set(key, (receivedBySkuPo.get(key) ?? 0) + l.qty);
+    if (sh.status === 'Received') {
+      for (const l of lines) {
+        if (!l.sku || l.qty <= 0) continue;
+        const key = `${sh.poNumber} ${l.sku}`;
+        receivedBySkuPo.set(key, (receivedBySkuPo.get(key) ?? 0) + l.qty);
+      }
+    } else if (sh.status === 'Planning' || sh.status === 'In Transit') {
+      // Cancelled is intentionally skipped — that qty isn't coming.
+      const ts = sh.eta ? Date.parse(sh.eta) : NaN;
+      const etaTs = Number.isFinite(ts) ? ts : Number.MAX_SAFE_INTEGER;
+      for (const l of lines) {
+        if (!l.sku || l.qty <= 0) continue;
+        const key = `${sh.poNumber} ${l.sku}`;
+        const list = allocBySkuPo.get(key) ?? [];
+        list.push({ shipmentId: sh.shipmentId, eta: sh.eta, etaTs, mode: sh.mode, qty: l.qty });
+        allocBySkuPo.set(key, list);
+      }
     }
   }
+  // Earliest-ETA shipments first so we land qty on the closest date when a
+  // PO line is split across multiple shipments.
+  for (const list of allocBySkuPo.values()) {
+    list.sort((a, b) => a.etaTs - b.etaTs);
+  }
+  // Track per-(po, sku) how much shipment alloc qty we've already used so
+  // splits across multiple PO-line rows for the same SKU don't double-dip.
+  const allocUsed = new Map<string, number>();
   const consumed = new Map<string, number>();
 
   for (const r of grid.slice(1)) {
@@ -1153,20 +1186,82 @@ export async function readPoAggregates(): Promise<Map<string, PoAggregates>> {
         continue;
       }
       const eta = str(r[5]);
-      // Date.parse handles ISO + most US-formatted dates; bad/blank ETAs
-      // sort to the end so they don't masquerade as "next."
       const ts = eta ? Date.parse(eta) : NaN;
-      agg.incoming.push({
-        poNumber,
-        mode: str(r[3]),
-        eta,
-        etaTimestamp: Number.isFinite(ts) ? ts : Number.MAX_SAFE_INTEGER,
-        qty: remaining,
-      });
+      const haveLineEta = Number.isFinite(ts);
+      const lineMode = str(r[3]);
+      if (haveLineEta) {
+        // PO line has its own ETA — trust it. Single entry, original behavior.
+        agg.incoming.push({
+          poNumber,
+          mode: lineMode,
+          eta,
+          etaTimestamp: ts as number,
+          qty: remaining,
+          status: 'Incoming',
+        });
+      } else {
+        // PO line ETA missing — fall back to non-Received shipments allocated
+        // to this (po, sku). Walk earliest-first, peeling off qty until
+        // the line's remaining is covered. Each shipment becomes its own
+        // IncomingPoLine so split shipments land on their real dates.
+        const allocList = allocBySkuPo.get(key) ?? [];
+        let need = remaining;
+        let used = allocUsed.get(key) ?? 0;
+        for (const a of allocList) {
+          if (need <= 0) break;
+          const availableHere = a.qty - Math.min(used, a.qty);
+          if (availableHere <= 0) {
+            // This shipment alloc is fully spoken for by an earlier PO row.
+            used = Math.max(0, used - a.qty);
+            continue;
+          }
+          const take = Math.min(need, availableHere);
+          agg.incoming.push({
+            poNumber,
+            mode: a.mode || lineMode,
+            eta: a.eta,
+            etaTimestamp: a.etaTs,
+            qty: take,
+            status: 'Incoming',
+          });
+          need -= take;
+          used = 0; // moved past this shipment
+          allocUsed.set(key, (allocUsed.get(key) ?? 0) + take);
+        }
+        if (need > 0) {
+          // No shipment covers the rest — keep an unknown-ETA entry so the
+          // planner still surfaces the qty (it'll sort to the end).
+          agg.incoming.push({
+            poNumber,
+            mode: lineMode,
+            eta: '',
+            etaTimestamp: Number.MAX_SAFE_INTEGER,
+            qty: need,
+            status: 'Incoming',
+          });
+        }
+      }
       if (mode === 'air') agg.inTransitAir += remaining;
       else if (mode === 'sea') agg.inTransitSea += remaining;
     } else if (status === 'draft') {
       agg.draftPo += qty;
+      // User-created drafts with an ETA are planned purchases. Surface them
+      // in incoming[] so the Coverage Planner counts them toward arrivals,
+      // tagged 'Draft' so the UI can show "not yet placed." Drafts WITHOUT
+      // an ETA stay out (no date → nowhere to slot them).
+      const dpoNumber = str(r[0]);
+      const dEta = str(r[5]);
+      const dTs = dEta ? Date.parse(dEta) : NaN;
+      if (Number.isFinite(dTs)) {
+        agg.incoming.push({
+          poNumber: dpoNumber,
+          mode: str(r[3]),
+          eta: dEta,
+          etaTimestamp: dTs as number,
+          qty,
+          status: 'Draft',
+        });
+      }
     }
     out.set(sku, agg);
   }
